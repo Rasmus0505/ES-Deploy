@@ -1,0 +1,208 @@
+﻿@import url('https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600;700;800&family=Geist+Mono:wght@400;500;600;700&family=Noto+Sans+SC:wght@400;500;600;700;800&display=swap');
+
+:root {
+  --ui-font-sans: 'Geist', 'Noto Sans SC', 'Inter', 'Microsoft YaHei', 'PingFang SC', sans-serif;
+  --ui-font-mono: 'Geist Mono', 'JetBrains Mono', 'SFMono-Regular', 'Cascadia Code', consolas, monospace;
+  --ui-type-tight: 1.3;
+  --ui-type-body: 1.72;
+  --ui-type-cjk: 1.78;
+}
+
+body {
+  font-family: var(--ui-font-sans);
+  font-size: 15px;
+  line-height: var(--ui-type-cjk);
+  font-synthesis-weight: none;
+  font-variant-east-asian: proportional-width;
+  text-rendering: optimizelegibility;
+}
+
+code,
+pre,
+kbd,
+samp {
+  font-family: var(--ui-font-mono);
+}
+
+.ui-type-h1,
+.ui-type-h2,
+.ui-type-h3,
+.ui-type-h4,
+.ui-type-p,
+.ui-type-lead,
+.ui-type-large,
+.ui-type-small,
+.ui-type-muted,
+.ui-type-blockquote,
+.ui-type-inline-code {
+  margin: 0;
+  font-family: var(--ui-font-sans);
+  text-wrap: pretty;
+}
+
+.ui-type-h1 {
+  font-size: clamp(2.1rem, 3.1vw, 2.7rem);
+  line-height: 1.15;
+  font-weight: 760;
+  letter-spacing: -0.026em;
+}
+
+.ui-type-h2 {
+  font-size: clamp(1.68rem, 2.3vw, 2.12rem);
+  line-height: 1.2;
+  font-weight: 740;
+  letter-spacing: -0.021em;
+}
+
+.ui-type-h3 {
+  font-size: clamp(1.34rem, 1.7vw, 1.62rem);
+  line-height: 1.25;
+  font-weight: 715;
+  letter-spacing: -0.016em;
+}
+
+.ui-type-h4 {
+  font-size: clamp(1.1rem, 1.3vw, 1.24rem);
+  line-height: 1.38;
+  font-weight: 650;
+}
+
+.ui-type-p {
+  font-size: 1rem;
+  line-height: var(--ui-type-body);
+  font-weight: 470;
+}
+
+.ui-type-lead {
+  font-size: 1.12rem;
+  line-height: 1.74;
+  font-weight: 530;
+  color: hsl(var(--foreground) / 0.92);
+}
+
+.ui-type-large {
+  font-size: 1.05rem;
+  line-height: 1.62;
+  font-weight: 620;
+  letter-spacing: -0.004em;
+}
+
+.ui-type-small {
+  font-size: 0.82rem;
+  line-height: 1.58;
+  font-weight: 560;
+  color: hsl(var(--muted-foreground));
+}
+
+.ui-type-muted {
+  font-size: 0.92rem;
+  line-height: 1.72;
+  font-weight: 480;
+  color: hsl(var(--muted-foreground));
+}
+
+.ui-type-blockquote {
+  border-left: 2px solid hsl(var(--border));
+  padding: 0.38rem 0.9rem;
+  font-style: italic;
+  line-height: 1.72;
+  color: hsl(var(--foreground) / 0.9);
+}
+
+.ui-type-inline-code {
+  display: inline;
+  border: 1px solid hsl(var(--border));
+  border-radius: 0.4rem;
+  background: hsl(var(--muted));
+  color: hsl(var(--foreground));
+  padding: 0.08rem 0.38rem;
+  font-family: var(--ui-font-mono);
+  font-size: 0.86em;
+  line-height: 1.35;
+  font-weight: 550;
+}
+
+.ui-type-content :where(ul, ol) {
+  margin: 0;
+  padding-inline-start: 1.3rem;
+  line-height: var(--ui-type-cjk);
+}
+
+.ui-type-content :where(li + li) {
+  margin-top: 0.26rem;
+}
+
+.ui-type-content :where(table) {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.95rem;
+  line-height: 1.68;
+}
+
+.ui-type-content :where(th, td) {
+  border: 1px solid hsl(var(--border));
+  text-align: left;
+  padding: 0.56rem 0.64rem;
+}
+
+.ui-type-content :where(th) {
+  background: hsl(var(--muted));
+  font-weight: 620;
+}
+
+.ui-type-content :where(blockquote) {
+  border-left: 2px solid hsl(var(--border));
+  margin: 0;
+  padding-left: 0.86rem;
+  color: hsl(var(--muted-foreground));
+}
+
+.ui-type-content :where(code):not(pre code) {
+  border: 1px solid hsl(var(--border));
+  border-radius: 0.4rem;
+  background: hsl(var(--muted));
+  padding: 0.08rem 0.38rem;
+  font-family: var(--ui-font-mono);
+  font-size: 0.86em;
+}
+
+.app-header__title-wrap > .ui-type-h1 {
+  font-size: clamp(1.22rem, 1.55vw, 1.42rem);
+  line-height: 1.23;
+}
+
+.app-header__title-wrap > .ui-type-muted {
+  margin-top: 2px;
+  font-size: 0.8rem;
+  line-height: 1.45;
+}
+
+[data-slot='sidebar-group-label'] .ui-type-small {
+  font-size: 11px;
+  line-height: 1.35;
+  font-weight: 800;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.app-shell-sidebar__user-email.ui-type-small {
+  font-size: 11px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.practice-live-feedback.ui-type-p {
+  font-size: 14px;
+  font-weight: 700;
+}
+
+.practice-reveal-hint.ui-type-muted {
+  font-weight: 700;
+}
+
+.practice-shortcut-item__label.ui-type-small {
+  font-size: 13px;
+  font-weight: 700;
+  color: hsl(var(--foreground));
+}

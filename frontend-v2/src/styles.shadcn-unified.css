@@ -1,0 +1,323 @@
+﻿/*
+ * Shadcn Unified Theme Overlay
+ * This file is intentionally imported after legacy styles to keep a single visual language.
+ */
+
+:root {
+  --background: 0 0% 4%;
+  --foreground: 0 0% 97%;
+  --muted: 0 0% 14%;
+  --muted-foreground: 0 0% 64%;
+  --popover: 0 0% 4%;
+  --popover-foreground: 0 0% 97%;
+  --card: 0 0% 4%;
+  --card-foreground: 0 0% 97%;
+  --border: 0 0% 17%;
+  --input: 0 0% 17%;
+  --ring: 0 0% 78%;
+  --primary: 0 0% 97%;
+  --primary-foreground: 0 0% 10%;
+  --secondary: 0 0% 14%;
+  --secondary-foreground: 0 0% 97%;
+  --accent: 0 0% 14%;
+  --accent-foreground: 0 0% 97%;
+  --destructive: 0 62.8% 30.6%;
+  --destructive-foreground: 0 0% 98%;
+  --success: 142 71% 45%;
+  --warning: 36 92% 56%;
+  --info: 0 0% 70%;
+
+  --radius: 12px;
+  --radius-sm: calc(var(--radius) - 4px);
+  --radius-md: calc(var(--radius) - 2px);
+  --radius-lg: calc(var(--radius) + 4px);
+
+  --shadow-card: 0 1px 0 rgba(255, 255, 255, 0.03), 0 16px 38px rgba(0, 0, 0, 0.56);
+  --shadow-hover: 0 0 0 1px rgba(255, 255, 255, 0.04), 0 18px 38px rgba(0, 0, 0, 0.6);
+}
+
+body {
+  color: hsl(var(--foreground));
+  background:
+    radial-gradient(circle at 14% -8%, rgba(255, 255, 255, 0.05), transparent 28%),
+    radial-gradient(circle at 100% 0%, rgba(255, 255, 255, 0.03), transparent 30%),
+    linear-gradient(180deg, #040404 0%, #020202 55%, #010101 100%);
+}
+
+.app-header {
+  border-bottom-color: hsl(var(--border));
+  background: linear-gradient(180deg, rgba(10, 10, 10, 0.92), rgba(6, 6, 6, 0.92));
+  backdrop-filter: blur(10px);
+}
+
+.app-header__module-tabs {
+  border-color: hsl(var(--border));
+  background: linear-gradient(180deg, rgba(30, 30, 30, 0.88), rgba(20, 20, 20, 0.88));
+}
+
+.ui-card,
+.history-item {
+  border-color: hsl(var(--border));
+  background: linear-gradient(180deg, rgba(14, 14, 14, 0.96), rgba(8, 8, 8, 0.96));
+  box-shadow: var(--shadow-card);
+}
+
+.ui-card__title {
+  font-weight: 700;
+  letter-spacing: -0.01em;
+}
+
+.ui-card__subtitle,
+.history-item__progress,
+.history-item__time,
+.upload-file-hint {
+  color: hsl(var(--muted-foreground));
+}
+
+.ui-hover-card__content {
+  border-color: hsl(var(--border));
+  background: linear-gradient(180deg, rgba(16, 16, 16, 0.98), rgba(10, 10, 10, 0.98));
+  box-shadow: var(--shadow-hover);
+}
+
+.ui-button {
+  border-radius: calc(var(--radius-sm) + 1px);
+  font-weight: 600;
+  letter-spacing: 0;
+  transition: border-color 150ms ease, background-color 150ms ease, color 150ms ease, transform 120ms ease, box-shadow 150ms ease;
+}
+
+.ui-button:hover {
+  box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.04), 0 12px 28px rgba(0, 0, 0, 0.42);
+}
+
+.ui-button:focus-visible,
+.ui-input:focus-visible,
+.ui-textarea:focus-visible,
+.ui-tabs__item:focus-visible,
+.ui-select-trigger:focus-visible,
+.ui-checkbox:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 2px rgba(2, 4, 8, 0.95), 0 0 0 4px hsl(var(--ring) / 0.42);
+}
+
+.ui-button--default {
+  --button-bg: hsl(0 0% 16%);
+  --button-fg: hsl(0 0% 94%);
+  --button-border: hsl(var(--border));
+}
+
+.ui-button--secondary {
+  --button-bg: hsl(0 0% 12%);
+  --button-fg: hsl(0 0% 90%);
+  --button-border: hsl(0 0% 20%);
+}
+
+.ui-button--outline {
+  --button-bg: rgba(255, 255, 255, 0.01);
+  --button-fg: hsl(var(--foreground));
+  --button-border: hsl(var(--border));
+}
+
+.ui-button--ghost {
+  --button-bg: transparent;
+  --button-fg: hsl(var(--muted-foreground));
+  --button-border: transparent;
+}
+
+.ui-button--ghost:hover {
+  --button-bg: hsl(var(--muted));
+  --button-fg: hsl(var(--foreground));
+}
+
+.ui-button--destructive {
+  --button-bg: hsl(var(--destructive) / 0.18);
+  --button-fg: hsl(0 90% 88%);
+  --button-border: hsl(var(--destructive) / 0.28);
+}
+
+.ui-label {
+  color: hsl(0 0% 83%);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.ui-input,
+.ui-textarea,
+.ui-select-trigger {
+  border-color: hsl(var(--input));
+  background: linear-gradient(180deg, rgba(18, 18, 18, 0.96), rgba(12, 12, 12, 0.96));
+  color: hsl(var(--foreground));
+}
+
+.ui-input::placeholder,
+.ui-textarea::placeholder {
+  color: hsl(0 0% 56%);
+}
+
+.ui-badge {
+  font-weight: 600;
+  border-color: hsl(var(--border));
+  background: hsl(0 0% 13%);
+  color: hsl(var(--foreground));
+}
+
+.ui-badge--success {
+  color: hsl(145 73% 74%);
+  background: hsl(145 73% 22% / 0.28);
+  border-color: hsl(145 73% 36% / 0.45);
+}
+
+.ui-badge--warning {
+  color: hsl(42 92% 74%);
+  background: hsl(40 92% 26% / 0.28);
+  border-color: hsl(40 92% 38% / 0.46);
+}
+
+.ui-badge--danger {
+  color: hsl(0 82% 79%);
+  background: hsl(0 72% 32% / 0.24);
+  border-color: hsl(0 72% 43% / 0.42);
+}
+
+.ui-badge--info {
+  color: hsl(0 0% 84%);
+  background: hsl(0 0% 34% / 0.26);
+  border-color: hsl(0 0% 44% / 0.44);
+}
+
+.ui-progress {
+  height: 9px;
+  border: 1px solid hsl(var(--border));
+  background: hsl(0 0% 10%);
+}
+
+.ui-progress__fill {
+  background: linear-gradient(90deg, hsl(0 0% 90%) 0%, hsl(0 0% 66%) 100%);
+}
+
+.ui-tabs {
+  border-color: hsl(var(--border));
+  background: hsl(0 0% 10%);
+}
+
+.ui-tabs__item {
+  color: hsl(0 0% 68%);
+}
+
+.ui-tabs__item:hover {
+  color: hsl(var(--foreground));
+  background: rgba(255, 255, 255, 0.03);
+}
+
+.ui-tabs__item.is-active {
+  border-color: hsl(var(--border));
+  color: hsl(var(--foreground));
+  background: hsl(0 0% 13%);
+}
+
+.ui-checkbox {
+  border-color: hsl(var(--input));
+  background: hsl(0 0% 9%);
+}
+
+.ui-checkbox[data-state='checked'],
+.ui-checkbox[data-state='indeterminate'] {
+  border-color: hsl(0 0% 84%);
+  background: hsl(0 0% 84%);
+  color: hsl(0 0% 10%);
+}
+
+.ui-kbd {
+  border-color: hsl(0 0% 25% / 0.95);
+  background: linear-gradient(180deg, hsl(0 0% 14% / 0.96), hsl(0 0% 10% / 0.96));
+  color: hsl(0 0% 94%);
+}
+
+.history-item {
+  transition: border-color 150ms ease, transform 150ms ease, box-shadow 150ms ease;
+}
+
+.history-item:hover {
+  border-color: hsl(0 0% 24%);
+  box-shadow: var(--shadow-hover);
+  transform: translateY(-1px);
+}
+
+.error-text {
+  color: hsl(0 84% 72%);
+}
+
+.ok-text {
+  color: hsl(146 70% 68%);
+}
+
+/* Shared utility primitives for future feature modules */
+.ui-shadcn-surface {
+  border: 1px solid hsl(var(--border));
+  border-radius: var(--radius-md);
+  background: linear-gradient(180deg, rgba(14, 14, 14, 0.98), rgba(8, 8, 8, 0.98));
+  box-shadow: var(--shadow-card);
+}
+
+.ui-shadcn-inline {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.ui-shadcn-stack {
+  display: grid;
+  gap: 10px;
+}
+
+.ui-shadcn-muted {
+  color: hsl(var(--muted-foreground));
+  font-size: 13px;
+}
+
+.ui-spinner {
+  width: 1rem;
+  height: 1rem;
+  border-radius: 999px;
+  border: 2px solid hsl(0 0% 30%);
+  border-top-color: hsl(0 0% 98%);
+  animation: ui-spinner-rotate 700ms linear infinite;
+}
+
+.ui-spinner--sm {
+  width: 0.875rem;
+  height: 0.875rem;
+  border-width: 2px;
+}
+
+.ui-spinner--md {
+  width: 1rem;
+  height: 1rem;
+}
+
+.ui-spinner--lg {
+  width: 1.25rem;
+  height: 1.25rem;
+  border-width: 2.5px;
+}
+
+@keyframes ui-spinner-rotate {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@media (max-width: 960px) {
+  .app-main__content {
+    padding: 10px;
+  }
+
+  .ui-card__header {
+    padding: 14px 14px 0;
+  }
+
+  .ui-card__body {
+    padding: 12px 14px 14px;
+  }
+}

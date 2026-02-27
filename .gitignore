@@ -1,0 +1,11 @@
+﻿node_modules/
+frontend-v2/node_modules/
+frontend-v2/dist/
+backend/.venv/
+backend/runtime/
+backend/runtime_jobs/
+data/
+AI分工/
+test-results/
+*.log
+成本管理/*_cost_ledger.csv

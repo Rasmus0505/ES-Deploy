@@ -1,0 +1,14 @@
+{
+  "model_prices_cny_per_million_tokens": {
+    "qwen-mt-flash": {
+      "input_cny_per_million_tokens": 0.7,
+      "output_cny_per_million_tokens": 1.95
+    }
+  },
+  "provider_prices_cny_per_million_tokens": {
+    "dashscope_qwen_mt_flash": {
+      "input_cny_per_million_tokens": 0.7,
+      "output_cny_per_million_tokens": 1.95
+    }
+  }
+}
