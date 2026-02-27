@@ -3,8 +3,13 @@
   "private": true,
   "version": "0.1.0",
   "type": "module",
+  "engines": {
+    "node": ">=20 <21"
+  },
   "scripts": {
+    "predeploy:check": "node scripts/predeploy-check.mjs --strict-env",
     "dev": "vite",
+    "build:zeabur": "npm run predeploy:check && npm run build",
     "build": "tsc -b && vite build",
     "preview": "vite preview"
   },
@@ -21,7 +26,6 @@
     "@radix-ui/react-tooltip": "^1.2.8",
     "class-variance-authority": "^0.7.1",
     "clsx": "^2.1.1",
-    "english-studying": "file:..",
     "lucide-react": "^0.544.0",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",

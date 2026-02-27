@@ -1,136 +1,140 @@
-﻿# English Studying（读写练习）
+# 读写练习（Zeabur 上线版）
 
-一个本地优先的英语学习应用，当前聚焦 **听力练习 + 学习数据中心**。
+本项目目标是公网可访问、必须登录、可持续运行的前后端分离部署。
 
-当前项目为：
-- 前端（主入口）：`frontend-v2/`（React + Vite + Shadcn New York / Neutral）
-- 后端：`backend/` FastAPI（字幕任务、历史记录）
-- 旧前端目录：`src/`（legacy，非主入口，进入下线观察）
+## 目录结构
 
----
-
-## 运行方式（推荐）
-
-### 一键启动（Windows）
-在项目根目录双击：
-
-```bat
-00_一键启动听力.bat
+```text
+.
+├─ backend/               # FastAPI 后端
+│  ├─ app/
+│  ├─ requirements.txt
+│  ├─ Procfile
+│  └─ start.sh
+├─ frontend-v2/           # React + Vite 前端
+├─ data/                  # 本地/容器持久数据目录（SQLite）
+└─ package.json
 ```
 
-该脚本内置完整启动流程，便于在资源管理器中快速定位启动文件。
+## 本地开发
 
-脚本会自动：
-1. 创建并安装后端虚拟环境 `backend/.venv`
-2. 安装 `frontend-v2` 依赖
-3. 清理占用端口 `8766/8510` 的旧进程
-4. 启动后端：`127.0.0.1:8766`
-5. 启动前端：`frontend-v2` Vite dev server `127.0.0.1:8510`
-6. 打开浏览器：`http://localhost:8510/listening`
-
-注意：脚本会强制结束占用 `8766/8510` 的进程，请避免在这两个端口运行无关服务。
-
-### 手动启动（可选）
+### 后端
 
 ```powershell
-# 1) 后端
 cd backend
 python -m venv .venv
 .\.venv\Scripts\python -m pip install -r requirements.txt
 .\.venv\Scripts\python -m uvicorn app.main:app --host 127.0.0.1 --port 8766
+```
 
-# 2) 前端（新终端）
-cd ..\frontend-v2
+### 前端
+
+```powershell
+cd frontend-v2
 npm install
 npm run dev -- --host 127.0.0.1 --port 8510 --strictPort
 ```
 
----
+默认访问：
 
-## 入口说明
+- 前端：`http://127.0.0.1:8510`
+- 后端：`http://127.0.0.1:8766`
 
-- 主前端：`http://localhost:8510/listening`
-- 数据中心：`http://localhost:8510/dashboard`
+## Zeabur 部署
 
----
+### 后端服务
 
-## 后端 API（当前）
+- 服务类型：Python
+- Root Directory：`backend`
+- Install Command：`pip install -r requirements.txt`
+- Start Command：`uvicorn app.main:app --host 0.0.0.0 --port $PORT`
+- 持久卷：挂载到项目 `data/`（用于 SQLite，避免重启丢失）
 
-基础：
-- `GET /api/v1/health`
+建议环境变量：
 
-历史记录：
-- `GET /api/v1/history-records`
-- `PUT /api/v1/history-records`
+- `AUTH_JWT_SECRET`：JWT 签名密钥（必须）
+- `APP_MASTER_KEY`：第三方 API Key 加密主密钥（必须）
+- `CORS_ALLOW_ORIGINS`：允许跨域源，逗号分隔（必须设置为前端域名）
+- `SUBTITLE_GLOBAL_CONCURRENCY`：全局并发上限（默认 `3`）
+- `SUBTITLE_PER_USER_CONCURRENCY`：单用户并发上限（默认 `1`）
+- `URL_SOURCE_ALLOWED_DOMAINS`：URL 任务允许域名（默认 `youtube.com,youtu.be,bilibili.com,b23.tv`）
+- `YT_DLP_EXECUTABLE`：`yt-dlp` 可执行路径（Zeabur 建议显式配置）
 
-字幕任务：
-- `POST /api/v1/subtitle-jobs`
-- `POST /api/v1/subtitle-jobs/from-url`
-- `POST /api/v1/subtitle-jobs/resume-llm`
-- `GET /api/v1/subtitle-jobs/{job_id}`
-- `GET /api/v1/subtitle-jobs/{job_id}/result`
-- `GET /api/v1/subtitle-jobs/{job_id}/video`
-- `DELETE /api/v1/subtitle-jobs/{job_id}`
+部署后运行依赖验收（`GET /api/v1/health`）：
 
-自动字幕配置探测：
-- `POST /api/v1/subtitle-config/test`
-- `POST /api/v1/subtitle-config/test-llm`
-- `POST /api/v1/subtitle-config/test-whisper`
-- `GET /api/v1/whisper/local-models`
+- `capabilities.subtitle_dep_ffmpeg=true`
+- `capabilities.subtitle_dep_ffprobe=true`
+- `capabilities.subtitle_dep_ytdlp=true`
 
-错误报告：
-- `POST /api/v1/browser-errors`
-- `GET /api/v1/browser-errors/read`
-  - 说明：以上接口为调试遗留能力，已进入 14 天下线观察窗口（2026-02-26 至 2026-03-12），响应头会返回 `X-Deprecated`。
+若 `ffmpeg/ffprobe=false`：在 Zeabur 添加系统包 `ffmpeg`。  
+若 `ytdlp=false`：确认容器内 `yt-dlp` 可执行存在，必要时设置 `YT_DLP_EXECUTABLE`。
 
----
+### 前端服务
 
-## 数据与存储
+- 服务类型：Node（静态站点）
+- Root Directory：`frontend-v2`
+- Node Version：`20.x`
+- Install Command：`npm ci --include=dev`
+- Build Command：`npm run build`
+- Output Directory：`dist`
 
-本地主要存储：
-- `localStorage`：学习统计、目标配置、UI 状态
-- `IndexedDB`：`ListeningPracticeDB`（含 `files`、`translations`）
+前端环境变量（Zeabur）：
 
-迁移原则：
-- 不改后端 API 签名
-- 不改既有本地键名
-- v2 前端通过兼容层读写旧数据
+- `NPM_CONFIG_PRODUCTION=false`
+- `NPM_CONFIG_INCLUDE=dev`
+- `VITE_SUBTITLE_API_BASE=https://<你的后端域名>/api/v1`
 
----
+说明：
 
-## 测试
+- `vite/client` 类型错误通常来自未安装 `devDependencies`，因此前端必须使用 `npm ci --include=dev`
+- 仓库已提供 `npm run predeploy:check` 与 `npm run build:zeabur` 作为部署前门禁（Node 20、`file:` 依赖、`vite/client` 类型解析、环境变量校验）
 
-### 根项目逻辑测试
+## 鉴权与接口
+
+认证接口：
+
+- `POST /api/v1/auth/register`
+- `POST /api/v1/auth/login`
+- `POST /api/v1/auth/logout`
+- `GET /api/v1/auth/me`
+
+除 `health` 与 `auth` 外，其余业务接口均要求：
+
+- `Authorization: Bearer <token>`
+
+## 安全与策略
+
+- 个人中心读取接口不再返回明文 `api_key`，仅返回 `api_key_masked` 与 `has_api_key`
+- 密钥写入使用独立接口：`PUT /api/v1/profile/keys`
+- URL 任务启用来源策略校验：
+  - 拒绝 `localhost`、内网/保留网段、回环地址
+  - 默认仅允许 YouTube/Bilibili 域名
+- `browser-errors` 调试接口已提前下线（410）
+
+## 验证命令
 
 ```powershell
-node --test tools/tests/subtitle-parser.test.mjs
-node --test tools/tests/subtitle-import-pipeline.test.mjs
-node --test tools/tests/listening-upload-v2-flow.test.mjs
-```
-
-### v2 前端构建检查
-
-```powershell
+# 前端构建
 npm --prefix frontend-v2 run build
+
+# 后端导入检查
+python -c "import sys; sys.path.insert(0, 'backend'); import app.main as m; print('import-ok')"
 ```
 
----
+部署前门禁（建议在 CI 或本地 Node 20 执行）：
 
-## 项目结构（简化）
-
-```text
-.
-├─ frontend-v2/                   # 主前端（React + Vite）
-├─ src/                           # legacy 目录（非主入口，待下线）
-├─ backend/                       # FastAPI 后端
-├─ tools/tests/                   # 测试脚本
-├─ 00_一键启动听力.bat            # 一键启动入口（推荐）
-└─ CHANGELOG.md
+```powershell
+cd frontend-v2
+$env:VITE_SUBTITLE_API_BASE="https://example.com/api/v1"
+npm ci --include=dev
+npm run predeploy:check
+npm run build
 ```
 
----
+可选审计：
 
-## 说明
-
-- 项目处于持续迭代中，具体改动请查看 `CHANGELOG.md`。
-- 以仓库当前代码为准，历史文档描述若有冲突，请以代码行为优先。
+```powershell
+cd backend
+.\.venv\Scripts\python -m pip install pip-audit
+.\.venv\Scripts\pip-audit
+```
