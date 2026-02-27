@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 from typing import Any
+from urllib.parse import urlsplit, urlunsplit
 
 import requests
 
@@ -23,6 +24,26 @@ def _normalize_api_prefix(raw: str) -> str:
     return value.rstrip("/")
 
 
+def _normalize_base_and_prefix(raw_base_url: str, raw_api_prefix: str) -> tuple[str, str]:
+    safe_base = _normalize_base_url(raw_base_url)
+    safe_prefix = _normalize_api_prefix(raw_api_prefix)
+    parsed = urlsplit(safe_base)
+    path = str(parsed.path or "").rstrip("/")
+    if not path:
+        return safe_base, safe_prefix
+    if path == safe_prefix or path.endswith(safe_prefix):
+        adjusted_path = path[: len(path) - len(safe_prefix)]
+        if adjusted_path == "/":
+            adjusted_path = ""
+        adjusted_base = urlunsplit((parsed.scheme, parsed.netloc, adjusted_path, parsed.query, parsed.fragment)).rstrip("/")
+        print(
+            "[DEBUG] OneAPI base url contains api prefix. "
+            f"Auto-normalized base_url from '{safe_base}' to '{adjusted_base}', prefix='{safe_prefix}'."
+        )
+        return adjusted_base, safe_prefix
+    return safe_base, safe_prefix
+
+
 @dataclass
 class OneAPIClientError(Exception):
     status_code: int
@@ -35,14 +56,18 @@ class OneAPIClientError(Exception):
 
 class OneAPIClient:
     def __init__(self) -> None:
-        self._base_url = _normalize_base_url(os.getenv("ONEAPI_BASE_URL", "http://127.0.0.1:3000"))
-        self._api_prefix = _normalize_api_prefix(os.getenv("ONEAPI_API_PREFIX", "/api"))
+        self._base_url, self._api_prefix = _normalize_base_and_prefix(
+            os.getenv("ONEAPI_BASE_URL", "http://127.0.0.1:3000"),
+            os.getenv("ONEAPI_API_PREFIX", "/api"),
+        )
         self._timeout_seconds = max(2.0, float(os.getenv("ONEAPI_TIMEOUT_SECONDS", "15")))
 
     def _build_url(self, path: str) -> str:
         safe_path = str(path or "").strip()
         if not safe_path.startswith("/"):
             safe_path = f"/{safe_path}"
+        if safe_path == self._api_prefix or safe_path.startswith(f"{self._api_prefix}/"):
+            return f"{self._base_url}{safe_path}"
         return f"{self._base_url}{self._api_prefix}{safe_path}"
 
     @staticmethod
@@ -93,14 +118,41 @@ class OneAPIClient:
         except requests.RequestException as exc:
             raise OneAPIClientError(status_code=502, code="oneapi_unreachable", message=f"OneAPI 网络请求失败: {exc}") from exc
 
-        try:
-            payload = response.json()
-        except Exception:
-            payload = {"message": response.text[:200]}
+        content_type = str(response.headers.get("content-type") or "").lower()
+        if "application/json" in content_type:
+            try:
+                payload: Any = response.json()
+            except Exception as exc:
+                raise OneAPIClientError(
+                    status_code=502,
+                    code="oneapi_invalid_json_response",
+                    message=f"OneAPI 返回了无法解析的 JSON: {exc}",
+                ) from exc
+        else:
+            payload = str(response.text or "").strip()
 
         if response.status_code >= 400:
             message = self._extract_error_message(payload) or f"OneAPI HTTP {response.status_code}"
+            lowered = str(message).lower()
+            if "<!doctype html" in lowered or "<html" in lowered:
+                message = "OneAPI 返回了 HTML 页面，请检查 ONEAPI_BASE_URL 与 ONEAPI_API_PREFIX"
+            if response.status_code == 404:
+                raise OneAPIClientError(status_code=404, code="oneapi_route_not_found", message=message)
             raise OneAPIClientError(status_code=response.status_code, code="oneapi_http_error", message=message)
+
+        if isinstance(payload, str):
+            lowered = payload.lower()
+            if lowered.startswith("<!doctype html") or lowered.startswith("<html") or "<html" in lowered[:160]:
+                print(
+                    "[DEBUG] OneAPI returned HTML payload with success status. "
+                    f"url={self._build_url(path)} content_type={content_type or '-'}"
+                )
+                raise OneAPIClientError(
+                    status_code=502,
+                    code="oneapi_unexpected_html",
+                    message="OneAPI 返回了 HTML 页面，请检查 ONEAPI_BASE_URL 与 ONEAPI_API_PREFIX",
+                )
+            return payload
 
         if isinstance(payload, dict):
             success = payload.get("success")

@@ -96,8 +96,28 @@ class AuthService:
         }
 
     @staticmethod
+    def _looks_like_upstream_config_error(exc: OneAPIClientError, message: str) -> bool:
+        safe_message = str(message or "").strip().lower()
+        safe_code = str(exc.code or "").strip().lower()
+        if safe_code in {"oneapi_route_not_found", "oneapi_unexpected_html", "oneapi_invalid_json_response"}:
+            return True
+        if "oneapi_base_url" in safe_message or "oneapi_api_prefix" in safe_message:
+            return True
+        if exc.status_code in {404, 502} and (
+            "not found" in safe_message or "html" in safe_message or "路由" in safe_message or "页面" in safe_message
+        ):
+            return True
+        return False
+
+    @staticmethod
     def _to_auth_error(exc: OneAPIClientError, *, scene: str) -> AuthError:
         safe_message = str(exc.message or "认证失败").strip() or "认证失败"
+        if AuthService._looks_like_upstream_config_error(exc, safe_message):
+            return AuthError(
+                502,
+                "auth_upstream_misconfigured",
+                "认证上游地址配置异常，请检查 ONEAPI_BASE_URL 与 ONEAPI_API_PREFIX",
+            )
         lower = safe_message.lower()
         if scene == "register":
             if exc.status_code == 409 or "已存在" in safe_message or "已被使用" in safe_message or "exist" in lower:

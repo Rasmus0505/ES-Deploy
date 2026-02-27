@@ -55,6 +55,9 @@ npm run dev -- --host 127.0.0.1 --port 8510 --strictPort
 - `AUTH_JWT_SECRET`：JWT 签名密钥（必须）
 - `APP_MASTER_KEY`：第三方 API Key 加密主密钥（必须）
 - `CORS_ALLOW_ORIGINS`：允许跨域源，逗号分隔（必须设置为前端域名）
+- `ONEAPI_BASE_URL`：OneAPI 服务根地址（例如 `https://oneapi.example.com`，不要额外拼 `/api` 两次）
+- `ONEAPI_API_PREFIX`：OneAPI 接口前缀（默认 `/api`）
+- `ONEAPI_V1_BASE_URL`：OneAPI 的 OpenAI 兼容地址（可留空，默认 `${ONEAPI_BASE_URL}/v1`）
 - `SUBTITLE_GLOBAL_CONCURRENCY`：全局并发上限（默认 `3`）
 - `SUBTITLE_PER_USER_CONCURRENCY`：单用户并发上限（默认 `1`）
 - `URL_SOURCE_ALLOWED_DOMAINS`：URL 任务允许域名（默认 `youtube.com,youtu.be,bilibili.com,b23.tv`）
@@ -75,7 +78,7 @@ npm run dev -- --host 127.0.0.1 --port 8510 --strictPort
 - Root Directory：`frontend-v2`
 - Node Version：`20.x`
 - Install Command：`npm ci --include=dev`
-- Build Command：`npm run build`
+- Build Command：`npm run build:zeabur`
 - Output Directory：`dist`
 
 前端环境变量（Zeabur）：
@@ -84,10 +87,17 @@ npm run dev -- --host 127.0.0.1 --port 8510 --strictPort
 - `NPM_CONFIG_INCLUDE=dev`
 - `VITE_SUBTITLE_API_BASE=https://<你的后端域名>/api/v1`
 
+部署建议（强烈推荐）：
+
+- 使用前后端双服务：前端域名与后端域名分离
+- 前端只负责静态页面；所有 API 请求通过 `VITE_SUBTITLE_API_BASE` 指向后端域名
+- 后端 `CORS_ALLOW_ORIGINS` 必须包含前端完整源（例如 `https://english.preview.aliyun-zeabur.cn`）
+
 说明：
 
 - `vite/client` 类型错误通常来自未安装 `devDependencies`，因此前端必须使用 `npm ci --include=dev`
 - 仓库已提供 `npm run predeploy:check` 与 `npm run build:zeabur` 作为部署前门禁（Node 20、`file:` 依赖、`vite/client` 类型解析、环境变量校验）
+- `build:zeabur` 会严格校验 `VITE_SUBTITLE_API_BASE`：必须是非 localhost 的 http(s) 地址，且必须以 `/api/v1` 结尾
 
 ## 鉴权与接口
 
@@ -121,6 +131,16 @@ npm --prefix frontend-v2 run build
 python -c "import sys; sys.path.insert(0, 'backend'); import app.main as m; print('import-ok')"
 ```
 
+线上验收（双服务）：
+
+```powershell
+# 1) 后端域名必须返回 JSON，不允许返回 HTML
+curl https://<后端域名>/api/v1/health
+
+# 2) 前端域名打开登录页后，抓包确认请求目标为 <后端域名>/api/v1/*
+# 3) 前端域名若直接访问 /api/v1/health 返回 HTML，说明 API 仍命中了前端服务
+```
+
 部署前门禁（建议在 CI 或本地 Node 20 执行）：
 
 ```powershell
@@ -128,7 +148,7 @@ cd frontend-v2
 $env:VITE_SUBTITLE_API_BASE="https://example.com/api/v1"
 npm ci --include=dev
 npm run predeploy:check
-npm run build
+npm run build:zeabur
 ```
 
 可选审计：

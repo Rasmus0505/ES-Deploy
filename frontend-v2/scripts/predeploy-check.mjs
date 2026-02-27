@@ -101,6 +101,23 @@ function checkApiBaseEnv() {
   if (!/^https?:\/\//i.test(value)) {
     fail(`VITE_SUBTITLE_API_BASE 必须是 http(s) URL，当前值: ${value}`);
   }
+  let parsed = null;
+  try {
+    parsed = new URL(value);
+  } catch {
+    fail(`VITE_SUBTITLE_API_BASE 不是合法 URL，当前值: ${value}`);
+  }
+  const hostname = String(parsed.hostname || '').toLowerCase();
+  if (hostname === 'localhost' || hostname === '127.0.0.1' || hostname === '0.0.0.0') {
+    fail(`生产部署禁止使用本地地址，当前 VITE_SUBTITLE_API_BASE=${value}`);
+  }
+  if (value.includes('<') || value.includes('>') || hostname === 'example.com') {
+    fail(`VITE_SUBTITLE_API_BASE 仍是占位值，请替换为真实后端域名，当前值: ${value}`);
+  }
+  const pathName = String(parsed.pathname || '').replace(/\/+$/, '');
+  if (!pathName.endsWith('/api/v1')) {
+    fail(`VITE_SUBTITLE_API_BASE 必须以 /api/v1 结尾，当前值: ${value}`);
+  }
   console.log(`[predeploy] 环境变量检查通过: VITE_SUBTITLE_API_BASE=${value}`);
 }
 
