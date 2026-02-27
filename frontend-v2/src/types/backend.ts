@@ -35,6 +35,14 @@ export type SubtitleJobOptionsPayload = Partial<Omit<SubtitleJobOptions, 'llm' |
 export interface JobCreateResponse {
   job_id: string;
   status: JobStatus;
+  source_url_policy?: SourceUrlPolicyResult | null;
+}
+
+export interface SourceUrlPolicyResult {
+  normalized_url: string;
+  host: string;
+  allowed: boolean;
+  reason: string;
 }
 
 export interface JobStageDetail {
@@ -225,18 +233,101 @@ export interface ProfileSettings {
   english_level_numeric: number;
   english_level_cefr: string;
   llm_mode: LlmMode;
-  llm_unified: LlmOptions;
-  llm_listening: LlmOptions;
-  llm_reading: LlmOptions;
+  llm_unified: LlmOptionsPublic;
+  llm_listening: LlmOptionsPublic;
+  llm_reading: LlmOptionsPublic;
   updated_at: number;
+}
+
+export interface LlmOptionsPublic {
+  base_url: string;
+  model: string;
+  llm_support_json: boolean;
+  api_key_masked: string;
+  has_api_key: boolean;
+}
+
+export interface LlmOptionsUpdate {
+  base_url: string;
+  model: string;
+  llm_support_json: boolean;
 }
 
 export interface ProfileSettingsUpdateRequest {
   english_level?: EnglishLevel;
   llm_mode?: LlmMode;
-  llm_unified?: LlmOptions;
-  llm_listening?: LlmOptions;
-  llm_reading?: LlmOptions;
+  llm_unified?: LlmOptionsUpdate;
+  llm_listening?: LlmOptionsUpdate;
+  llm_reading?: LlmOptionsUpdate;
+}
+
+export interface ProfileKeysUpdateRequest {
+  llm_unified_api_key?: string;
+  llm_listening_api_key?: string;
+  llm_reading_api_key?: string;
+}
+
+export interface ProfileKeysUpdateResponse {
+  status: 'ok';
+  updated_fields: string[];
+}
+
+export interface AuthRegisterRequest {
+  username: string;
+  password: string;
+}
+
+export interface AuthLoginRequest {
+  username: string;
+  password: string;
+}
+
+export interface AuthUserResponse {
+  user_id: string;
+  username: string;
+  created_at: number;
+}
+
+export interface AuthTokenResponse {
+  token_type: 'bearer';
+  access_token: string;
+  expires_at: number;
+  user: AuthUserResponse;
+}
+
+export interface AuthLogoutResponse {
+  status: 'ok';
+}
+
+export interface WalletQuotaResponse {
+  user_id: string;
+  username: string;
+  quota: number;
+  used_quota: number;
+  remaining_quota: number;
+  request_count: number;
+}
+
+export interface WalletRedeemRequest {
+  key: string;
+}
+
+export interface WalletRedeemResponse extends WalletQuotaResponse {
+  status: 'ok';
+  added_quota: number;
+}
+
+export interface WalletPackItem {
+  id: string;
+  label: string;
+  price: number;
+  quota: number;
+  description: string;
+}
+
+export interface WalletPacksResponse {
+  packs: WalletPackItem[];
+  cost_multiplier: number;
 }
 
 export interface ReadingChoiceQuestion {

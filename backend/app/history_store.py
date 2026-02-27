@@ -22,9 +22,62 @@ class SqliteHistoryStore:
     def _init_db(self) -> None:
         with self._lock:
             with self._connect() as connection:
+                existing = connection.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table' AND name='learning_history' LIMIT 1"
+                ).fetchone()
+                if existing:
+                    columns = {
+                        str(row["name"]).strip()
+                        for row in connection.execute("PRAGMA table_info(learning_history)").fetchall()
+                    }
+                    if "user_id" not in columns:
+                        connection.execute(
+                            """
+                            CREATE TABLE IF NOT EXISTS learning_history_v2 (
+                                user_id TEXT NOT NULL,
+                                video_name TEXT NOT NULL,
+                                srt_name TEXT NOT NULL,
+                                current_index INTEGER NOT NULL DEFAULT 0,
+                                total_sentences INTEGER NOT NULL DEFAULT 0,
+                                thumbnail TEXT NOT NULL DEFAULT '',
+                                timestamp INTEGER NOT NULL DEFAULT 0,
+                                completed INTEGER NOT NULL DEFAULT 0,
+                                history_id TEXT NOT NULL DEFAULT '',
+                                display_name TEXT NOT NULL DEFAULT '',
+                                folder_id TEXT NOT NULL DEFAULT '',
+                                subtitle_task_meta TEXT NOT NULL DEFAULT '',
+                                PRIMARY KEY (user_id, video_name, srt_name)
+                            )
+                            """
+                        )
+                        connection.execute(
+                            """
+                            INSERT OR REPLACE INTO learning_history_v2(
+                                user_id, video_name, srt_name, current_index, total_sentences,
+                                thumbnail, timestamp, completed, history_id, display_name, folder_id, subtitle_task_meta
+                            )
+                            SELECT
+                                'legacy',
+                                video_name,
+                                srt_name,
+                                current_index,
+                                total_sentences,
+                                thumbnail,
+                                timestamp,
+                                completed,
+                                history_id,
+                                display_name,
+                                folder_id,
+                                subtitle_task_meta
+                            FROM learning_history
+                            """
+                        )
+                        connection.execute("DROP TABLE learning_history")
+                        connection.execute("ALTER TABLE learning_history_v2 RENAME TO learning_history")
                 connection.execute(
                     """
                     CREATE TABLE IF NOT EXISTS learning_history (
+                        user_id TEXT NOT NULL DEFAULT 'legacy',
                         video_name TEXT NOT NULL,
                         srt_name TEXT NOT NULL,
                         current_index INTEGER NOT NULL DEFAULT 0,
@@ -36,7 +89,7 @@ class SqliteHistoryStore:
                         display_name TEXT NOT NULL DEFAULT '',
                         folder_id TEXT NOT NULL DEFAULT '',
                         subtitle_task_meta TEXT NOT NULL DEFAULT '',
-                        PRIMARY KEY (video_name, srt_name)
+                        PRIMARY KEY (user_id, video_name, srt_name)
                     )
                     """
                 )
@@ -56,10 +109,19 @@ class SqliteHistoryStore:
                     connection.execute(
                         "ALTER TABLE learning_history ADD COLUMN subtitle_task_meta TEXT NOT NULL DEFAULT ''"
                     )
+                if "user_id" not in existing_columns:
+                    connection.execute(
+                        "ALTER TABLE learning_history ADD COLUMN user_id TEXT NOT NULL DEFAULT 'legacy'"
+                    )
                 connection.execute(
-                    "CREATE INDEX IF NOT EXISTS idx_learning_history_ts ON learning_history(timestamp DESC)"
+                    "CREATE INDEX IF NOT EXISTS idx_learning_history_user_ts ON learning_history(user_id, timestamp DESC)"
                 )
                 connection.commit()
+
+    @staticmethod
+    def _normalize_user_id(user_id: str) -> str:
+        safe = str(user_id or "").strip()
+        return safe or "legacy"
 
     @staticmethod
     def _normalize_subtitle_task_meta(raw: Any) -> dict[str, Any] | None:
@@ -137,12 +199,14 @@ class SqliteHistoryStore:
             "subtitleTaskMeta": SqliteHistoryStore._normalize_subtitle_task_meta(record.get("subtitleTaskMeta")),
         }
 
-    def list_records(self) -> list[dict[str, Any]]:
+    def list_records(self, *, user_id: str = "legacy") -> list[dict[str, Any]]:
+        safe_user_id = self._normalize_user_id(user_id)
         with self._lock:
             with self._connect() as connection:
                 rows = connection.execute(
                     """
                     SELECT
+                        user_id,
                         video_name,
                         srt_name,
                         current_index,
@@ -155,8 +219,10 @@ class SqliteHistoryStore:
                         folder_id,
                         subtitle_task_meta
                     FROM learning_history
+                    WHERE user_id=?
                     ORDER BY timestamp DESC
-                    """
+                    """,
+                    (safe_user_id,),
                 ).fetchall()
 
         records: list[dict[str, Any]] = []
@@ -178,7 +244,8 @@ class SqliteHistoryStore:
             )
         return records
 
-    def replace_all_records(self, records: list[dict[str, Any]]) -> int:
+    def replace_all_records(self, records: list[dict[str, Any]], *, user_id: str = "legacy") -> int:
+        safe_user_id = self._normalize_user_id(user_id)
         deduped: dict[tuple[str, str], dict[str, Any]] = {}
         for raw_record in records or []:
             normalized = self._normalize_record(raw_record)
@@ -193,10 +260,11 @@ class SqliteHistoryStore:
 
         with self._lock:
             with self._connect() as connection:
-                connection.execute("DELETE FROM learning_history")
+                connection.execute("DELETE FROM learning_history WHERE user_id=?", (safe_user_id,))
                 connection.executemany(
                     """
                     INSERT INTO learning_history (
+                        user_id,
                         video_name,
                         srt_name,
                         current_index,
@@ -208,10 +276,11 @@ class SqliteHistoryStore:
                         display_name,
                         folder_id,
                         subtitle_task_meta
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     [
                         (
+                            safe_user_id,
                             item["videoName"],
                             item["srtName"],
                             item["currentIndex"],

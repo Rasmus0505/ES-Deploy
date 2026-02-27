@@ -1,4 +1,4 @@
-import { AudioLines, BookOpenText, LayoutDashboard, UploadCloud } from 'lucide-react';
+import { AudioLines, BookOpenText, LayoutDashboard, UploadCloud, WalletCards } from 'lucide-react';
 
 export type AppNavItem = {
   id: string;
@@ -39,6 +39,13 @@ export const appNavGroups: AppNavGroup[] = [
         label: '阅读强化',
         subtitle: '分级改写与理解题',
         icon: BookOpenText
+      },
+      {
+        id: 'wallet',
+        path: '/wallet',
+        label: '额度中心',
+        subtitle: '兑换码充值与余额',
+        icon: WalletCards
       }
     ]
   },

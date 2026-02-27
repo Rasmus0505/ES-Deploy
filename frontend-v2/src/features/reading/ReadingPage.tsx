@@ -133,7 +133,7 @@ function getReadingGenerateErrorMessage(error: unknown) {
     const detail = payload && typeof payload === 'object' ? payload.detail : null;
     const detailCode = detail && typeof detail === 'object' ? String((detail as { code?: unknown }).code || '').trim() : '';
     if (detailCode === 'reading_llm_required') {
-      return '阅读 LLM 未配置。请先到个人中心配置阅读 LLM（Base URL / Model / API Key）。';
+      return '系统模型通道异常，请稍后重试或联系管理员。';
     }
     if (detailCode === 'reading_generation_quality_failed' || detailCode === 'reading_quiz_generation_failed') {
       return '已自动重试 2 轮仍未达标，可更换模型或稍后重试。';
@@ -170,7 +170,7 @@ const DEFAULT_CONFIG: ReadingConfigState = {
 
 export function ReadingPage() {
   const location = useLocation();
-  const { profile, loading: profileLoading, error: profileError } = useProfileSettings();
+  const { profile, error: profileError } = useProfileSettings();
   const [historyRows, setHistoryRows] = useState<HistoryRecord[]>([]);
   const [sourceRows, setSourceRows] = useState<ReadingSourceSummary[]>([]);
   const [readingHistory, setReadingHistory] = useState<ReadingHistoryItem[]>([]);
@@ -319,10 +319,10 @@ export function ReadingPage() {
   }, [refreshHistory]);
 
   useEffect(() => {
-    if (!userLevelTouched && !profileLoading) {
+    if (!userLevelTouched) {
       setUserLevel(profile.english_level);
     }
-  }, [profile.english_level, profileLoading, userLevelTouched]);
+  }, [profile.english_level, userLevelTouched]);
 
   useEffect(() => {
     if (availableHistory.length === 0) {
@@ -370,10 +370,6 @@ export function ReadingPage() {
   const handleGenerate = async () => {
     if (!selectedRecord) {
       setGenerateError('请先选择素材来源');
-      return;
-    }
-    if (profileLoading) {
-      toast.warning('个人中心配置加载中，请稍后再试');
       return;
     }
 
@@ -580,7 +576,7 @@ export function ReadingPage() {
             <CardHeader
               title="生成配置"
               subtitle="默认英语等级来自个人中心，点击按钮后在弹窗确认生成参数。"
-              action={<Badge tone={profileLoading ? 'warning' : 'default'}>{profileLoading ? '读取配置中' : `等级 ${profile.english_level}`}</Badge>}
+              action={<Badge>{`等级 ${profile.english_level}`}</Badge>}
             />
             <CardBody className="reading-v2__config-grid">
               {profileError ? <TypographyP className="error-text">{profileError}</TypographyP> : null}
@@ -615,7 +611,7 @@ export function ReadingPage() {
                 </Select>
               </div>
               <div className="reading-v2__config-actions">
-                <Button type="button" onClick={() => setGenerateDialogOpen(true)} disabled={!selectedRecord || generating || profileLoading} icon={<BookCheck size={16} strokeWidth={1.8} />}>
+                <Button type="button" onClick={() => setGenerateDialogOpen(true)} disabled={!selectedRecord || generating} icon={<BookCheck size={16} strokeWidth={1.8} />}>
                   {generating ? '生成中...' : '生成阅读包'}
                 </Button>
               </div>
@@ -762,7 +758,7 @@ export function ReadingPage() {
             <DrawerDescription>确认本次生成范围与参数后开始生成。</DrawerDescription>
           </DrawerHeader>
           <div className="reading-v2__dialog-grid">
-            <TypographyMuted>智能重生成已启用：当 LLM 配置或质量策略变化时会自动绕过缓存。</TypographyMuted>
+            <TypographyMuted>智能重生成已启用：当模型策略或质量策略变化时会自动绕过缓存。</TypographyMuted>
             <div>
               <Label htmlFor="readingScope">范围</Label>
               <Select id="readingScope" value={config.scope} onChange={(event) => setConfig((prev) => ({ ...prev, scope: event.target.value as ReadingScope }))}>
@@ -807,7 +803,7 @@ export function ReadingPage() {
           <DrawerFooter>
             <div className="reading-v2__dialog-actions">
               <Button type="button" variant="outline" onClick={() => setGenerateDialogOpen(false)}>取消</Button>
-              <Button type="button" onClick={() => void handleGenerate()} disabled={!selectedRecord || generating || profileLoading}>
+              <Button type="button" onClick={() => void handleGenerate()} disabled={!selectedRecord || generating}>
                 {generating ? '生成中...' : '确认生成'}
               </Button>
             </div>

@@ -53,9 +53,17 @@ class SubtitleJobFromUrlRequest(BaseModel):
     options: SubtitleJobOptions = Field(default_factory=SubtitleJobOptions)
 
 
+class SourceUrlPolicyResult(BaseModel):
+    normalized_url: str = ""
+    host: str = ""
+    allowed: bool = False
+    reason: str = ""
+
+
 class JobCreateResponse(BaseModel):
     job_id: str
     status: JobStatus
+    source_url_policy: Optional[SourceUrlPolicyResult] = None
 
 
 class JobStageDetail(BaseModel):
@@ -296,14 +304,28 @@ class ReadingSourcesResponse(BaseModel):
     sources: list[ReadingSourceSummary] = Field(default_factory=list)
 
 
+class LlmOptionsPublic(BaseModel):
+    base_url: str = Field(default=DEFAULT_LLM_BASE_URL)
+    model: str = Field(default="gpt-5.2")
+    llm_support_json: bool = Field(default=False)
+    api_key_masked: str = Field(default="")
+    has_api_key: bool = Field(default=False)
+
+
+class LlmOptionsUpdate(BaseModel):
+    base_url: str = Field(default=DEFAULT_LLM_BASE_URL)
+    model: str = Field(default="gpt-5.2")
+    llm_support_json: bool = Field(default=False)
+
+
 class ProfileSettings(BaseModel):
     english_level: Literal["junior", "senior", "cet4", "cet6", "kaoyan", "toefl", "sat"] = Field(default="cet4")
     english_level_numeric: float = Field(default=7.5)
     english_level_cefr: str = Field(default="B1")
     llm_mode: Literal["unified", "custom"] = Field(default="unified")
-    llm_unified: LlmOptions = Field(default_factory=LlmOptions)
-    llm_listening: LlmOptions = Field(default_factory=LlmOptions)
-    llm_reading: LlmOptions = Field(default_factory=LlmOptions)
+    llm_unified: LlmOptionsPublic = Field(default_factory=LlmOptionsPublic)
+    llm_listening: LlmOptionsPublic = Field(default_factory=LlmOptionsPublic)
+    llm_reading: LlmOptionsPublic = Field(default_factory=LlmOptionsPublic)
     updated_at: int = Field(default=0)
 
     @model_validator(mode="after")
@@ -322,9 +344,89 @@ class ProfileSettings(BaseModel):
 class ProfileSettingsUpdateRequest(BaseModel):
     english_level: Optional[Literal["junior", "senior", "cet4", "cet6", "kaoyan", "toefl", "sat"]] = None
     llm_mode: Optional[Literal["unified", "custom"]] = None
-    llm_unified: Optional[LlmOptions] = None
-    llm_listening: Optional[LlmOptions] = None
-    llm_reading: Optional[LlmOptions] = None
+    llm_unified: Optional[LlmOptionsUpdate] = None
+    llm_listening: Optional[LlmOptionsUpdate] = None
+    llm_reading: Optional[LlmOptionsUpdate] = None
+
+
+class ProfileKeysUpdateRequest(BaseModel):
+    llm_unified_api_key: Optional[str] = None
+    llm_listening_api_key: Optional[str] = None
+    llm_reading_api_key: Optional[str] = None
+
+
+class ProfileKeysUpdateResponse(BaseModel):
+    status: Literal["ok"] = "ok"
+    updated_fields: list[str] = Field(default_factory=list)
+
+
+class AuthRegisterRequest(BaseModel):
+    username: str = Field(default="", min_length=3, max_length=64)
+    password: str = Field(default="", min_length=8, max_length=128)
+
+
+class AuthLoginRequest(BaseModel):
+    username: str = Field(default="", min_length=3, max_length=64)
+    password: str = Field(default="", min_length=8, max_length=128)
+
+
+class AuthUserResponse(BaseModel):
+    user_id: str = ""
+    username: str = ""
+    created_at: int = 0
+
+
+class AuthTokenResponse(BaseModel):
+    token_type: Literal["bearer"] = "bearer"
+    access_token: str = ""
+    expires_at: int = 0
+    user: AuthUserResponse = Field(default_factory=AuthUserResponse)
+
+
+class AuthLogoutResponse(BaseModel):
+    status: Literal["ok"] = "ok"
+
+
+class WalletQuotaResponse(BaseModel):
+    user_id: str = ""
+    username: str = ""
+    quota: int = 0
+    used_quota: int = 0
+    remaining_quota: int = 0
+    request_count: int = 0
+
+
+class WalletRedeemRequest(BaseModel):
+    key: str = Field(default="", min_length=1, max_length=128)
+
+    @model_validator(mode="after")
+    def normalize(self) -> "WalletRedeemRequest":
+        self.key = str(self.key or "").strip()
+        return self
+
+
+class WalletRedeemResponse(BaseModel):
+    status: Literal["ok"] = "ok"
+    added_quota: int = 0
+    user_id: str = ""
+    username: str = ""
+    quota: int = 0
+    used_quota: int = 0
+    remaining_quota: int = 0
+    request_count: int = 0
+
+
+class WalletPackItem(BaseModel):
+    id: str = ""
+    label: str = ""
+    price: float = 0.0
+    quota: int = 0
+    description: str = ""
+
+
+class WalletPacksResponse(BaseModel):
+    packs: list[WalletPackItem] = Field(default_factory=list)
+    cost_multiplier: float = 3.0
 
 
 class ReadingChoiceQuestion(BaseModel):

@@ -21,6 +21,8 @@ import {
   useSidebar
 } from '../components/ui/sidebar';
 import { TypographyH1, TypographyMuted, TypographySmall } from '../components/ui/typography';
+import { logoutAuth } from '../lib/api/auth';
+import { clearAuthToken } from '../lib/api/auth-token';
 import { appNavGroups, type AppNavItem } from './navigation';
 import { AppRoutes } from './AppRoutes';
 
@@ -29,7 +31,8 @@ const titleMap: Record<string, { title: string; subtitle: string }> = {
   '/listening': { title: '听力上传与自动字幕', subtitle: '本地与 URL 上传，任务状态可观察' },
   '/listening/practice': { title: '听力练习', subtitle: '句级听写、快捷键与沉浸式输入' },
   '/reading': { title: '阅读强化工坊', subtitle: '分级改写、关键词讲解、理解题与复盘' },
-  '/profile': { title: '个人中心', subtitle: '统一管理英语等级与 LLM 配置' }
+  '/wallet': { title: '额度中心', subtitle: '兑换码充值、额度余额与档位说明' },
+  '/profile': { title: '个人中心', subtitle: '管理英语等级与学习账户信息' }
 };
 
 const SIDEBAR_COLLAPSE_STORAGE_KEY = 'appSidebarCollapsed';
@@ -50,6 +53,7 @@ function AppShellContent() {
     setOpenMobile(false);
   }, [setOpenMobile]);
 
+  const isLoginRoute = location.pathname === '/login';
   const header = useMemo(() => titleMap[location.pathname] || titleMap['/listening'], [location.pathname]);
 
   const isItemActive = useCallback((item: AppNavItem) => isPathActive(item.path, location.pathname), [location.pathname]);
@@ -57,6 +61,27 @@ function AppShellContent() {
   useEffect(() => {
     closeMobile();
   }, [closeMobile, location.pathname]);
+
+  const handleLogout = useCallback(async () => {
+    try {
+      await logoutAuth();
+    } catch {
+      clearAuthToken();
+    } finally {
+      navigate('/login', { replace: true });
+    }
+  }, [navigate]);
+
+  if (isLoginRoute) {
+    return (
+      <>
+        <section className="app-main__content">
+          <AppRoutes />
+        </section>
+        <Toaster position="top-center" richColors closeButton />
+      </>
+    );
+  }
 
   return (
     <>
@@ -78,8 +103,8 @@ function AppShellContent() {
           </div>
           <SidebarMenu className="app-shell-sidebar__profile-shortcut">
             <SidebarMenuItem>
-              <SidebarMenuButton asChild isActive={isPathActive('/profile', location.pathname)} tooltip="个人中心 · 英语等级与 LLM 配置">
-                <NavLink to="/profile" title="个人中心 · 英语等级与 LLM 配置" onClick={closeMobile}>
+              <SidebarMenuButton asChild isActive={isPathActive('/profile', location.pathname)} tooltip="个人中心 · 英语等级与账户说明">
+                <NavLink to="/profile" title="个人中心 · 英语等级与账户说明" onClick={closeMobile}>
                   <Wrench size={18} strokeWidth={1.8} />
                   <span>个人中心</span>
                 </NavLink>
@@ -141,6 +166,14 @@ function AppShellContent() {
               onClick={() => navigate('/listening')}
             >
               新建听力任务
+            </Button>
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              onClick={() => void handleLogout()}
+            >
+              退出登录
             </Button>
           </div>
         </header>

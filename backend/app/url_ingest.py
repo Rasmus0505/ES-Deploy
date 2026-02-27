@@ -3,9 +3,11 @@ from __future__ import annotations
 import importlib.util
 import functools
 import hashlib
+import ipaddress
 import os
 import re
 import shutil
+import socket
 import sqlite3
 import subprocess
 import sys
@@ -21,21 +23,31 @@ from vendor.videolingo_subtitle_core.engine import PipelineError
 CancelCheck = Callable[[], bool]
 ProgressCallback = Callable[[int, str], None]
 
-_LOCAL_YTDLP_ENTRY_DEFAULT = Path(r"D:\GITHUB\yt-dlp\yt_dlp\__main__.py")
+_LOCAL_YTDLP_ENTRY_DEFAULT = ""
 _DOWNLOAD_TIMEOUT_SECONDS = 900
 _URL_SCAN_PATTERN = re.compile(r"https?://[^\s<>'\"`]+", re.IGNORECASE)
 _URL_TRAILING_TRIM = re.compile(r"[)\]}>,.;!?。！？；，、》】）]+$")
 _URL_INLINE_BREAK = re.compile(r"[，。！？；、）】》]")
-_AUTO_DISCOVER_SEARCH_ROOTS_DEFAULT = (
-    Path(r"D:\GITHUB"),
-    Path.home() / "GITHUB",
-)
+_AUTO_DISCOVER_SEARCH_ROOTS_DEFAULT: tuple[Path, ...] = ()
 _AUTO_DISCOVER_LIMIT = 20
 _CACHE_LOCK = threading.RLock()
 _CACHE_TTL_SECONDS = max(1, int(float(os.getenv("URL_SOURCE_CACHE_TTL_DAYS", "14")))) * 24 * 3600
 _CACHE_MAX_BYTES = max(1024 * 1024, int(float(os.getenv("URL_SOURCE_CACHE_MAX_GB", "30")) * 1024 * 1024 * 1024))
 _CACHE_ROOT = Path(__file__).resolve().parents[1] / "runtime" / "source-cache"
 _CACHE_DB = _CACHE_ROOT / "index.sqlite3"
+_DOWNLOAD_CONCURRENCY_LIMIT = max(1, int(float(os.getenv("URL_SOURCE_DOWNLOAD_CONCURRENCY", "3"))))
+_DOWNLOAD_SEMAPHORE = threading.BoundedSemaphore(_DOWNLOAD_CONCURRENCY_LIMIT)
+_SOURCE_ALLOWED_DOMAINS_DEFAULT = (
+    "youtube.com",
+    "youtu.be",
+    "bilibili.com",
+    "b23.tv",
+)
+_SOURCE_ALLOWED_DOMAINS = tuple(
+    item.strip().lower()
+    for item in str(os.getenv("URL_SOURCE_ALLOWED_DOMAINS", ",".join(_SOURCE_ALLOWED_DOMAINS_DEFAULT))).split(",")
+    if str(item or "").strip()
+)
 
 
 def _is_valid_http_url(value: str) -> bool:
@@ -68,11 +80,156 @@ def _extract_http_url_candidates(raw: str) -> list[str]:
     return candidates
 
 
+def _normalize_source_url_format(url: str) -> str:
+    value = str(url or "").strip()
+    if _is_valid_http_url(value):
+        parsed = urlparse(value)
+        normalized_path = parsed.path or "/"
+        normalized_query = parsed.query or ""
+        return urlunparse((parsed.scheme.lower(), parsed.netloc.lower(), normalized_path, "", normalized_query, ""))
+
+    candidates = _extract_http_url_candidates(value)
+    if candidates:
+        candidate = candidates[0]
+        parsed = urlparse(candidate)
+        normalized_path = parsed.path or "/"
+        normalized_query = parsed.query or ""
+        return urlunparse((parsed.scheme.lower(), parsed.netloc.lower(), normalized_path, "", normalized_query, ""))
+
+    raise PipelineError(
+        stage="download_source",
+        code="invalid_source_url",
+        message="视频链接无效，请输入完整的 http(s) 链接",
+        detail=f"url={value[:200]}",
+    )
+
+
+def _parse_host_from_url(url: str) -> str:
+    try:
+        parsed = urlparse(url if "://" in url else f"https://{url}")
+    except Exception:
+        return ""
+    return str(parsed.hostname or "").strip().lower()
+
+
+def _is_loopback_hostname(host: str) -> bool:
+    safe = str(host or "").strip().lower()
+    if not safe:
+        return False
+    return safe in {"localhost", "ip6-localhost"} or safe.endswith(".localhost")
+
+
+def _is_blocked_ip(ip_text: str) -> bool:
+    try:
+        ip_obj = ipaddress.ip_address(str(ip_text or "").strip())
+    except Exception:
+        return False
+    return bool(
+        ip_obj.is_loopback
+        or ip_obj.is_private
+        or ip_obj.is_link_local
+        or ip_obj.is_reserved
+        or ip_obj.is_unspecified
+        or ip_obj.is_multicast
+    )
+
+
+def _resolve_host_ips(host: str) -> set[str]:
+    safe_host = str(host or "").strip()
+    if not safe_host:
+        return set()
+    try:
+        addresses = socket.getaddrinfo(safe_host, None, type=socket.SOCK_STREAM)
+    except Exception:
+        return set()
+    resolved: set[str] = set()
+    for item in addresses:
+        sockaddr = item[4]
+        if not isinstance(sockaddr, tuple) or not sockaddr:
+            continue
+        ip_text = str(sockaddr[0] or "").strip()
+        if ip_text:
+            resolved.add(ip_text)
+    return resolved
+
+
+def _host_matches_allowlist(host: str) -> bool:
+    safe_host = str(host or "").strip().lower()
+    if not safe_host:
+        return False
+    if not _SOURCE_ALLOWED_DOMAINS:
+        return True
+    for domain in _SOURCE_ALLOWED_DOMAINS:
+        safe_domain = str(domain or "").strip().lower()
+        if not safe_domain:
+            continue
+        if safe_host == safe_domain or safe_host.endswith(f".{safe_domain}"):
+            return True
+    return False
+
+
+def evaluate_source_url_policy(url: str) -> dict[str, str | bool]:
+    normalized_url = _normalize_source_url_format(url)
+    host = _parse_host_from_url(normalized_url)
+    if not host:
+        return {
+            "normalized_url": normalized_url,
+            "host": "",
+            "allowed": False,
+            "reason": "url_host_missing",
+        }
+    if _is_loopback_hostname(host):
+        return {
+            "normalized_url": normalized_url,
+            "host": host,
+            "allowed": False,
+            "reason": "host_loopback_not_allowed",
+        }
+
+    host_ip_literal = ""
+    try:
+        host_ip_literal = str(ipaddress.ip_address(host))
+    except Exception:
+        host_ip_literal = ""
+
+    if host_ip_literal and _is_blocked_ip(host_ip_literal):
+        return {
+            "normalized_url": normalized_url,
+            "host": host,
+            "allowed": False,
+            "reason": "host_private_ip_not_allowed",
+        }
+
+    for resolved_ip in _resolve_host_ips(host):
+        if _is_blocked_ip(resolved_ip):
+            return {
+                "normalized_url": normalized_url,
+                "host": host,
+                "allowed": False,
+                "reason": "dns_private_ip_not_allowed",
+            }
+
+    if not _host_matches_allowlist(host):
+        return {
+            "normalized_url": normalized_url,
+            "host": host,
+            "allowed": False,
+            "reason": "host_not_in_allowlist",
+        }
+
+    return {
+        "normalized_url": normalized_url,
+        "host": host,
+        "allowed": True,
+        "reason": "ok",
+    }
+
+
 def _iter_search_roots() -> list[Path]:
     env_roots = str(os.getenv("YT_DLP_SEARCH_ROOTS", "")).strip()
     candidates: list[Path] = []
     if env_roots:
-        for item in env_roots.split(";"):
+        for item in env_roots.split(os.pathsep):
             value = str(item or "").strip()
             if not value:
                 continue
@@ -133,22 +290,15 @@ def _discover_local_yt_dlp_entries() -> tuple[str, ...]:
 
 
 def normalize_source_url(url: str) -> str:
-    value = str(url or "").strip()
-    if _is_valid_http_url(value):
-        parsed = urlparse(value)
-        normalized_path = parsed.path or "/"
-        normalized_query = parsed.query or ""
-        return urlunparse((parsed.scheme.lower(), parsed.netloc.lower(), normalized_path, "", normalized_query, ""))
-
-    candidates = _extract_http_url_candidates(value)
-    if candidates:
-        return candidates[0]
-
+    policy = evaluate_source_url_policy(url)
+    if bool(policy.get("allowed")):
+        return str(policy.get("normalized_url") or "")
+    reason = str(policy.get("reason") or "source_url_not_allowed")
     raise PipelineError(
         stage="download_source",
-        code="invalid_source_url",
-        message="视频链接无效，请输入完整的 http(s) 链接",
-        detail=f"url={value[:200]}",
+        code="source_url_not_allowed",
+        message="链接不在允许范围（仅支持公开视频站点，且拒绝内网地址）",
+        detail=f"reason={reason}; host={policy.get('host')}; url={policy.get('normalized_url')}",
     )
 
 
@@ -363,49 +513,62 @@ def download_video_from_url(
             detail="请检查 YT_DLP_LOCAL_ENTRY、YT_DLP_EXECUTABLE、YT_DLP_SEARCH_ROOTS 或 PATH 中的 yt-dlp 可执行文件",
         )
 
-    last_error: PipelineError | None = None
-    for command, source in commands:
-        try:
-            print(f"[DEBUG] URL ingest using yt-dlp source: {source}")
-            downloaded = _run_download(
-                command=command,
-                source_url=safe_url,
-                output_root=output_root,
-                should_cancel=should_cancel,
-                on_progress=on_progress,
-                timeout_seconds=timeout_seconds,
-            )
+    acquired = _DOWNLOAD_SEMAPHORE.acquire(timeout=8)
+    if not acquired:
+        raise PipelineError(
+            stage="download_source",
+            code="download_concurrency_limit",
+            message="下载任务繁忙，请稍后重试",
+            detail=f"limit={_DOWNLOAD_CONCURRENCY_LIMIT}",
+        )
+    try:
+        last_error: PipelineError | None = None
+        for command, source in commands:
             try:
-                _record_downloaded_file_to_cache(normalized_url=safe_url, downloaded_path=Path(downloaded))
-            except Exception as cache_exc:
-                print(f"[DEBUG] URL ingest cache store failed: {cache_exc}")
-            print(f"[DEBUG] URL ingest downloaded file: {downloaded}")
-            return downloaded
-        except PipelineError as exc:
-            last_error = exc
-            if exc.code in {"yt_dlp_launch_failed", "yt_dlp_command_failed", "download_output_missing"}:
-                print(f"[DEBUG] yt-dlp source failed ({source}): {exc.code} -> {exc.message}")
-                continue
-            raise
+                print(f"[DEBUG] URL ingest using yt-dlp source: {source}")
+                downloaded = _run_download(
+                    command=command,
+                    source_url=safe_url,
+                    output_root=output_root,
+                    should_cancel=should_cancel,
+                    on_progress=on_progress,
+                    timeout_seconds=timeout_seconds,
+                )
+                try:
+                    _record_downloaded_file_to_cache(normalized_url=safe_url, downloaded_path=Path(downloaded))
+                except Exception as cache_exc:
+                    print(f"[DEBUG] URL ingest cache store failed: {cache_exc}")
+                print(f"[DEBUG] URL ingest downloaded file: {downloaded}")
+                return downloaded
+            except PipelineError as exc:
+                last_error = exc
+                if exc.code in {"yt_dlp_launch_failed", "yt_dlp_command_failed", "download_output_missing"}:
+                    print(f"[DEBUG] yt-dlp source failed ({source}): {exc.code} -> {exc.message}")
+                    continue
+                raise
 
-    detail = last_error.detail if last_error else "unknown"
-    raise PipelineError(
-        stage="download_source",
-        code="download_failed",
-        message="链接素材下载失败",
-        detail=detail,
-    )
+        detail = last_error.detail if last_error else "unknown"
+        raise PipelineError(
+            stage="download_source",
+            code="download_failed",
+            message="链接素材下载失败",
+            detail=detail,
+        )
+    finally:
+        _DOWNLOAD_SEMAPHORE.release()
 
 
 def _resolve_yt_dlp_commands() -> list[tuple[list[str], str]]:
     commands: list[tuple[list[str], str]] = []
 
-    local_entry = Path(os.getenv("YT_DLP_LOCAL_ENTRY", str(_LOCAL_YTDLP_ENTRY_DEFAULT))).expanduser()
-    if local_entry.is_file():
-        commands.append(([sys.executable, str(local_entry)], f"local-entry:{local_entry}"))
-    else:
-        for discovered in _discover_local_yt_dlp_entries():
-            commands.append(([sys.executable, discovered], f"auto-discovered:{discovered}"))
+    local_entry_value = str(os.getenv("YT_DLP_LOCAL_ENTRY", _LOCAL_YTDLP_ENTRY_DEFAULT)).strip()
+    if local_entry_value:
+        local_entry = Path(local_entry_value).expanduser()
+        if local_entry.is_file():
+            commands.append(([sys.executable, str(local_entry)], f"local-entry:{local_entry}"))
+
+    for discovered in _discover_local_yt_dlp_entries():
+        commands.append(([sys.executable, discovered], f"auto-discovered:{discovered}"))
 
     configured_exec = str(os.getenv("YT_DLP_EXECUTABLE", "")).strip()
     if configured_exec:

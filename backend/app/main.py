@@ -6,19 +6,22 @@ import json
 import mimetypes
 import os
 import re
+import shutil
 import traceback
 import uuid
 import wave
 from io import BytesIO
 from pathlib import Path
+from time import time
 from urllib.parse import urlparse
 
 import requests
-from fastapi import FastAPI, File, Form, HTTPException, Request, Response, UploadFile
+from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, Response, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from openai import OpenAI
 
+from app.auth_service import AuthError, AuthPrincipal, AuthService
 from app.history_store import SqliteHistoryStore
 from app.job_manager import SubtitleJobManager
 from app.llm_cost_ledger import append_llm_cost_record
@@ -35,8 +38,14 @@ from app.reading_pipeline import QUALITY_RETRY_BUDGET as READING_QUALITY_RETRY_B
 from app.reading_pipeline import QUALITY_STRATEGY_TAG as READING_QUALITY_STRATEGY_TAG
 from app.reading_pipeline import ReadingPipelineError, generate_reading_material, grade_short_answer
 from app.reading_store import SqliteReadingStore
-from app.url_ingest import normalize_source_url
+from app.security_crypto import mask_secret
+from app.url_ingest import evaluate_source_url_policy, normalize_source_url
 from app.schemas import (
+    AuthLoginRequest,
+    AuthLogoutResponse,
+    AuthRegisterRequest,
+    AuthTokenResponse,
+    AuthUserResponse,
     BrowserErrorReadResponse,
     BrowserErrorReportRequest,
     BrowserErrorReportResponse,
@@ -49,6 +58,8 @@ from app.schemas import (
     JobStatusResponse,
     LlmOptions,
     ProfileSettings,
+    ProfileKeysUpdateRequest,
+    ProfileKeysUpdateResponse,
     ProfileSettingsUpdateRequest,
     ReadingHistoryItem,
     ReadingHistoryResponse,
@@ -64,6 +75,11 @@ from app.schemas import (
     SubtitleConfigTestResponse,
     SubtitleJobFromUrlRequest,
     SubtitleJobOptions,
+    WalletPackItem,
+    WalletPacksResponse,
+    WalletQuotaResponse,
+    WalletRedeemRequest,
+    WalletRedeemResponse,
     WhisperLocalModelsResponse,
     WhisperLocalModelStatus,
 )
@@ -91,20 +107,127 @@ READING_CACHE_QUALITY_STRATEGY_KEY = "quality_strategy"
 READING_CACHE_QUALITY_RETRY_KEY = "quality_retry_budget"
 BROWSER_ERRORS_DEPRECATION_HEADER = "browser-errors endpoints will be removed after 14-day grace period"
 BROWSER_ERRORS_DEPRECATION_END_DATE = "2026-03-12"
+DEFAULT_CORS_ALLOW_ORIGINS = (
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
+    "http://localhost:8510",
+    "http://127.0.0.1:8510",
+)
+DEFAULT_GLOBAL_JOB_LIMIT = 3
+DEFAULT_USER_JOB_LIMIT = 1
+ONEAPI_BASE_URL = str(os.getenv("ONEAPI_BASE_URL", "http://127.0.0.1:3000")).strip().rstrip("/")
+ONEAPI_API_PREFIX = str(os.getenv("ONEAPI_API_PREFIX", "/api")).strip() or "/api"
+if not ONEAPI_API_PREFIX.startswith("/"):
+    ONEAPI_API_PREFIX = f"/{ONEAPI_API_PREFIX}"
+ONEAPI_V1_BASE_URL = str(os.getenv("ONEAPI_V1_BASE_URL", "")).strip() or f"{ONEAPI_BASE_URL}/v1"
+WALLET_COST_MULTIPLIER = max(0.01, float(os.getenv("WALLET_COST_MULTIPLIER", "3") or 3))
+DEFAULT_WALLET_PACKS = [
+    {"id": "trial", "label": "试用包", "price": 0.9, "quota": 90000, "description": "低门槛快速体验"},
+    {"id": "standard", "label": "标准包", "price": 9.9, "quota": 990000, "description": "日常高频学习"},
+    {"id": "pro", "label": "进阶包", "price": 99.0, "quota": 9900000, "description": "长期稳定使用"},
+]
+
+
+def _resolve_cors_allow_origins() -> list[str]:
+    raw = str(os.getenv("CORS_ALLOW_ORIGINS", "")).strip()
+    if not raw:
+        return list(DEFAULT_CORS_ALLOW_ORIGINS)
+    values = [str(item or "").strip() for item in raw.split(",")]
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for item in values:
+        if not item:
+            continue
+        key = item.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(item)
+    return deduped or list(DEFAULT_CORS_ALLOW_ORIGINS)
+
+
+def _now_ms() -> int:
+    return int(round(time() * 1000))
+
+
+def _resolve_wallet_packs() -> list[dict]:
+    raw = str(os.getenv("WALLET_PACKS_JSON", "")).strip()
+    if not raw:
+        return list(DEFAULT_WALLET_PACKS)
+    try:
+        parsed = json.loads(raw)
+    except Exception as exc:
+        print(f"[DEBUG] Invalid WALLET_PACKS_JSON, fallback to defaults: {exc}")
+        return list(DEFAULT_WALLET_PACKS)
+    if not isinstance(parsed, list):
+        return list(DEFAULT_WALLET_PACKS)
+    normalized: list[dict] = []
+    for idx, item in enumerate(parsed):
+        if not isinstance(item, dict):
+            continue
+        try:
+            price = float(item.get("price") or 0)
+            quota = int(item.get("quota") or 0)
+        except Exception:
+            continue
+        if price <= 0 or quota <= 0:
+            continue
+        normalized.append(
+            {
+                "id": str(item.get("id") or f"pack_{idx + 1}").strip() or f"pack_{idx + 1}",
+                "label": str(item.get("label") or f"套餐{idx + 1}").strip() or f"套餐{idx + 1}",
+                "price": round(price, 2),
+                "quota": quota,
+                "description": str(item.get("description") or "").strip(),
+            }
+        )
+    return normalized or list(DEFAULT_WALLET_PACKS)
+
+
+WALLET_PACKS = _resolve_wallet_packs()
+
+
+def _build_oneapi_user_llm_payload(*, access_token: str, raw_llm: dict | None = None) -> dict:
+    safe = _sanitize_llm_options_payload(raw_llm if isinstance(raw_llm, dict) else None)
+    return _sanitize_llm_options_payload(
+        {
+            "base_url": ONEAPI_V1_BASE_URL,
+            "api_key": str(access_token or "").strip(),
+            "model": str(safe.get("model") or DEFAULT_PROFILE_LLM_MODEL).strip() or DEFAULT_PROFILE_LLM_MODEL,
+            "llm_support_json": bool(safe.get("llm_support_json", False)),
+        }
+    )
+
+
+def _inject_job_llm_options_from_principal(*, options: dict, principal: AuthPrincipal) -> dict:
+    safe_options = dict(options if isinstance(options, dict) else {})
+    llm_raw = safe_options.get("llm") if isinstance(safe_options.get("llm"), dict) else {}
+    safe_options["llm"] = _build_oneapi_user_llm_payload(
+        access_token=principal.access_token,
+        raw_llm=llm_raw if isinstance(llm_raw, dict) else None,
+    )
+    return safe_options
+
 
 app = FastAPI(title="Listening Subtitle Backend", version="0.1.0")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=_resolve_cors_allow_origins(),
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-job_manager = SubtitleJobManager(runtime_root=str(RUNTIME_JOBS_ROOT))
 history_store = SqliteHistoryStore(db_path=str(LOCAL_SQLITE_DB))
 reading_store = SqliteReadingStore(db_path=str(LOCAL_SQLITE_DB))
 profile_store = reading_store
+auth_service = AuthService()
+job_manager = SubtitleJobManager(
+    runtime_root=str(RUNTIME_JOBS_ROOT),
+    db_path=str(LOCAL_SQLITE_DB),
+    global_concurrency_limit=max(1, int(os.getenv("SUBTITLE_GLOBAL_CONCURRENCY", str(DEFAULT_GLOBAL_JOB_LIMIT)))),
+    per_user_concurrency_limit=max(1, int(os.getenv("SUBTITLE_PER_USER_CONCURRENCY", str(DEFAULT_USER_JOB_LIMIT)))),
+)
 LOCAL_WHISPER_MODEL_CANDIDATES = ("tiny", "base", "small", "medium", "large-v3")
 
 
@@ -192,6 +315,41 @@ def _safe_positive_int(value) -> int:
     except Exception:
         return 0
     return parsed if parsed > 0 else 0
+
+
+def _auth_http_exception(exc: AuthError) -> HTTPException:
+    return HTTPException(status_code=exc.status_code, detail=exc.to_detail())
+
+
+def _require_principal(request: Request) -> AuthPrincipal:
+    try:
+        return auth_service.authenticate_request(request)
+    except AuthError as exc:
+        raise _auth_http_exception(exc) from exc
+
+
+def _to_wallet_quota_response(payload: dict) -> WalletQuotaResponse:
+    safe = payload if isinstance(payload, dict) else {}
+    return WalletQuotaResponse.model_validate(
+        {
+            "user_id": str(safe.get("user_id") or ""),
+            "username": str(safe.get("username") or ""),
+            "quota": int(safe.get("quota") or 0),
+            "used_quota": int(safe.get("used_quota") or 0),
+            "remaining_quota": int(safe.get("remaining_quota") or 0),
+            "request_count": int(safe.get("request_count") or 0),
+        }
+    )
+
+
+def _to_wallet_packs_response() -> WalletPacksResponse:
+    packs = [WalletPackItem.model_validate(item).model_dump() for item in WALLET_PACKS]
+    return WalletPacksResponse.model_validate(
+        {
+            "packs": packs,
+            "cost_multiplier": WALLET_COST_MULTIPLIER,
+        }
+    )
 
 
 def _infer_llm_provider_effective(base_url: str) -> str:
@@ -569,6 +727,16 @@ def _probe_vl_flow_dependencies() -> tuple[bool, dict[str, bool]]:
     return all(dependency_status.values()), dependency_status
 
 
+def _probe_binary_dependency(*names: str) -> bool:
+    for item in names:
+        safe = str(item or "").strip()
+        if not safe:
+            continue
+        if shutil.which(safe):
+            return True
+    return False
+
+
 def _test_whisper_config(options: SubtitleJobOptions) -> SubtitleConfigProbeResult:
     runtime = (options.whisper.runtime or "cloud").strip().lower()
     if runtime == "local":
@@ -615,7 +783,9 @@ def _persist_reading_source_from_job_result(record, payload: dict) -> None:
         return
     video_name, srt_name = _infer_reading_source_names(record, payload)
     summary_terms = _extract_summary_terms_from_result(payload)
+    owner_user_id = str(getattr(record, "user_id", "") or "").strip() or "legacy"
     reading_store.upsert_source(
+        user_id=owner_user_id,
         video_name=video_name,
         srt_name=srt_name,
         subtitles=[item for item in subtitles if isinstance(item, dict)],
@@ -688,15 +858,48 @@ def _normalize_profile_settings_payload(payload: dict | None) -> dict:
     llm_mode = str(data.get("llm_mode") or "").strip().lower()
     if llm_mode not in {"unified", "custom"}:
         llm_mode = "unified"
+    llm_unified = _sanitize_llm_options_payload(data.get("llm_unified") if isinstance(data.get("llm_unified"), dict) else None)
+    llm_listening = _sanitize_llm_options_payload(
+        data.get("llm_listening") if isinstance(data.get("llm_listening"), dict) else None
+    )
+    llm_reading = _sanitize_llm_options_payload(data.get("llm_reading") if isinstance(data.get("llm_reading"), dict) else None)
     return {
         "english_level": english_level,
         "english_level_numeric": float(data.get("english_level_numeric") or 7.5),
         "english_level_cefr": str(data.get("english_level_cefr") or "").strip() or "B1",
         "llm_mode": llm_mode,
-        "llm_unified": _sanitize_llm_options_payload(data.get("llm_unified") if isinstance(data.get("llm_unified"), dict) else None),
-        "llm_listening": _sanitize_llm_options_payload(data.get("llm_listening") if isinstance(data.get("llm_listening"), dict) else None),
-        "llm_reading": _sanitize_llm_options_payload(data.get("llm_reading") if isinstance(data.get("llm_reading"), dict) else None),
+        "llm_unified": llm_unified,
+        "llm_listening": llm_listening,
+        "llm_reading": llm_reading,
         "updated_at": int(data.get("updated_at") or 0),
+    }
+
+
+def _to_public_llm_payload(raw: dict | None) -> dict:
+    safe = _sanitize_llm_options_payload(raw if isinstance(raw, dict) else None)
+    secret = str(safe.get("api_key") or "").strip()
+    return {
+        "base_url": str(safe.get("base_url") or "").strip() or DEFAULT_LLM_BASE_URL,
+        "model": str(safe.get("model") or "").strip() or DEFAULT_PROFILE_LLM_MODEL,
+        "llm_support_json": bool(safe.get("llm_support_json", False)),
+        "has_api_key": bool(secret),
+        "api_key_masked": mask_secret(secret) if secret else "",
+    }
+
+
+def _to_public_profile_settings_payload(payload: dict | None) -> dict:
+    safe = _normalize_profile_settings_payload(payload if isinstance(payload, dict) else {})
+    return {
+        "english_level": str(safe.get("english_level") or "cet4"),
+        "english_level_numeric": float(safe.get("english_level_numeric") or 7.5),
+        "english_level_cefr": str(safe.get("english_level_cefr") or "B1"),
+        "llm_mode": str(safe.get("llm_mode") or "unified"),
+        "llm_unified": _to_public_llm_payload(safe.get("llm_unified") if isinstance(safe.get("llm_unified"), dict) else {}),
+        "llm_listening": _to_public_llm_payload(
+            safe.get("llm_listening") if isinstance(safe.get("llm_listening"), dict) else {}
+        ),
+        "llm_reading": _to_public_llm_payload(safe.get("llm_reading") if isinstance(safe.get("llm_reading"), dict) else {}),
+        "updated_at": int(safe.get("updated_at") or 0),
     }
 
 
@@ -824,6 +1027,9 @@ async def capture_unexpected_backend_errors(request: Request, call_next):
 @app.get("/api/v1/health", response_model=HealthResponse)
 def get_health() -> HealthResponse:
     deps_ready, dep_detail = _probe_vl_flow_dependencies()
+    ffmpeg_ready = _probe_binary_dependency("ffmpeg")
+    ffprobe_ready = _probe_binary_dependency("ffprobe")
+    ytdlp_ready = _probe_binary_dependency("yt-dlp", "yt_dlp")
     return HealthResponse(
         capabilities={
             "subtitle_jobs_conflict_409": True,
@@ -838,23 +1044,32 @@ def get_health() -> HealthResponse:
             "subtitle_vl_dep_spacy": dep_detail.get("spacy", False),
             "subtitle_vl_dep_pandas": dep_detail.get("pandas", False),
             "subtitle_vl_dep_openpyxl": dep_detail.get("openpyxl", False),
+            "subtitle_dep_ffmpeg": ffmpeg_ready,
+            "subtitle_dep_ffprobe": ffprobe_ready,
+            "subtitle_dep_ytdlp": ytdlp_ready,
             "reading_sources_api": True,
             "reading_material_generate_api": True,
             "profile_settings_api": True,
             "reading_history_api": True,
             "reading_versions_api": True,
             "reading_short_answer_api": True,
+            "auth_required_for_business_apis": True,
         }
     )
 
 
 @app.get("/api/v1/whisper/local-models", response_model=WhisperLocalModelsResponse)
-def get_whisper_local_models() -> WhisperLocalModelsResponse:
+def get_whisper_local_models(principal: AuthPrincipal = Depends(_require_principal)) -> WhisperLocalModelsResponse:
+    _ = principal
     return _probe_local_whisper_models()
 
 
 @app.post("/api/v1/subtitle-config/test", response_model=SubtitleConfigTestResponse)
-def test_subtitle_config(payload: SubtitleJobOptions) -> SubtitleConfigTestResponse:
+def test_subtitle_config(
+    payload: SubtitleJobOptions,
+    principal: AuthPrincipal = Depends(_require_principal),
+) -> SubtitleConfigTestResponse:
+    _ = principal
     llm_result, llm_usage = _normalize_llm_probe_output(_test_llm_config(payload))
     whisper_result = _test_whisper_config(payload)
     if llm_result.ok and whisper_result.ok:
@@ -878,7 +1093,11 @@ def test_subtitle_config(payload: SubtitleJobOptions) -> SubtitleConfigTestRespo
 
 
 @app.post("/api/v1/subtitle-config/test-llm", response_model=SubtitleConfigTestResponse)
-def test_subtitle_config_llm(payload: SubtitleJobOptions) -> SubtitleConfigTestResponse:
+def test_subtitle_config_llm(
+    payload: SubtitleJobOptions,
+    principal: AuthPrincipal = Depends(_require_principal),
+) -> SubtitleConfigTestResponse:
+    _ = principal
     llm_result, llm_usage = _normalize_llm_probe_output(_test_llm_config(payload))
     whisper_placeholder = SubtitleConfigProbeResult(ok=True, message="已跳过（本次仅测试 LLM）")
     status = "ok" if llm_result.ok else "failed"
@@ -897,7 +1116,11 @@ def test_subtitle_config_llm(payload: SubtitleJobOptions) -> SubtitleConfigTestR
 
 
 @app.post("/api/v1/subtitle-config/test-whisper", response_model=SubtitleConfigTestResponse)
-def test_subtitle_config_whisper(payload: SubtitleJobOptions) -> SubtitleConfigTestResponse:
+def test_subtitle_config_whisper(
+    payload: SubtitleJobOptions,
+    principal: AuthPrincipal = Depends(_require_principal),
+) -> SubtitleConfigTestResponse:
+    _ = principal
     whisper_result = _test_whisper_config(payload)
     llm_placeholder = SubtitleConfigProbeResult(ok=True, message="已跳过（本次仅测试 Whisper）")
     status = "ok" if whisper_result.ok else "failed"
@@ -906,91 +1129,155 @@ def test_subtitle_config_whisper(payload: SubtitleJobOptions) -> SubtitleConfigT
 
 @app.post("/api/v1/browser-errors", response_model=BrowserErrorReportResponse)
 def write_browser_error_report(payload: BrowserErrorReportRequest, response: Response) -> BrowserErrorReportResponse:
+    _ = payload
     _mark_browser_errors_deprecated(response)
-    target_path = _resolve_error_file(payload.file_name)
-    if payload.action == "clear":
-        target_path.write_text("", encoding="utf-8")
-        print(
-            f"[DEPRECATED][browser-errors] POST /api/v1/browser-errors action=clear "
-            f"target={target_path} removal_date={BROWSER_ERRORS_DEPRECATION_END_DATE}"
-        )
-        print(f"[DEBUG] Cleared browser error report: {target_path}")
-    else:
-        content = payload.content.strip()
-        if not content:
-            raise HTTPException(status_code=400, detail="content is required for append action")
-        with target_path.open("a", encoding="utf-8") as stream:
-            stream.write(content + "\n")
-        print(
-            f"[DEPRECATED][browser-errors] POST /api/v1/browser-errors action=append "
-            f"target={target_path} removal_date={BROWSER_ERRORS_DEPRECATION_END_DATE}"
-        )
-        print(f"[DEBUG] Appended browser error report: {target_path}")
-    return BrowserErrorReportResponse(action=payload.action, file_path=str(target_path))
+    raise HTTPException(
+        status_code=410,
+        detail={
+            "code": "browser_errors_endpoint_removed",
+            "message": "browser-errors 调试接口已提前下线，请使用后端日志定位问题",
+        },
+    )
 
 
 @app.get("/api/v1/browser-errors/read", response_model=BrowserErrorReadResponse)
 def read_browser_error_report(response: Response, file_name: str = "browser-error.log") -> BrowserErrorReadResponse:
+    _ = file_name
     _mark_browser_errors_deprecated(response)
-    target_path = _resolve_error_file(file_name)
-    print(
-        f"[DEPRECATED][browser-errors] GET /api/v1/browser-errors/read "
-        f"target={target_path} removal_date={BROWSER_ERRORS_DEPRECATION_END_DATE}"
+    raise HTTPException(
+        status_code=410,
+        detail={
+            "code": "browser_errors_endpoint_removed",
+            "message": "browser-errors 调试接口已提前下线，请使用后端日志定位问题",
+        },
     )
-    if not target_path.exists():
-        return BrowserErrorReadResponse(file_path=str(target_path), content="", line_count=0, byte_size=0)
 
-    content = target_path.read_text(encoding="utf-8")
-    line_count = len([line for line in content.splitlines() if line.strip()])
-    byte_size = target_path.stat().st_size
-    return BrowserErrorReadResponse(
-        file_path=str(target_path),
-        content=content,
-        line_count=line_count,
-        byte_size=byte_size,
-    )
+
+@app.post("/api/v1/auth/register", response_model=AuthTokenResponse)
+def register(payload: AuthRegisterRequest) -> AuthTokenResponse:
+    try:
+        token_payload = auth_service.register(username=payload.username, password=payload.password)
+    except AuthError as exc:
+        raise _auth_http_exception(exc) from exc
+    return AuthTokenResponse.model_validate(token_payload)
+
+
+@app.post("/api/v1/auth/login", response_model=AuthTokenResponse)
+def login(payload: AuthLoginRequest) -> AuthTokenResponse:
+    try:
+        token_payload = auth_service.login(username=payload.username, password=payload.password)
+    except AuthError as exc:
+        raise _auth_http_exception(exc) from exc
+    return AuthTokenResponse.model_validate(token_payload)
+
+
+@app.post("/api/v1/auth/logout", response_model=AuthLogoutResponse)
+def logout(principal: AuthPrincipal = Depends(_require_principal)) -> AuthLogoutResponse:
+    auth_service.logout(principal)
+    return AuthLogoutResponse(status="ok")
+
+
+@app.get("/api/v1/auth/me", response_model=AuthUserResponse)
+def get_auth_me(principal: AuthPrincipal = Depends(_require_principal)) -> AuthUserResponse:
+    try:
+        user_payload = auth_service.get_user_public(principal)
+    except AuthError as exc:
+        raise _auth_http_exception(exc) from exc
+    return AuthUserResponse.model_validate(user_payload)
+
+
+@app.get("/api/v1/wallet/quota", response_model=WalletQuotaResponse)
+def get_wallet_quota(principal: AuthPrincipal = Depends(_require_principal)) -> WalletQuotaResponse:
+    try:
+        quota_payload = auth_service.get_wallet_quota(principal)
+    except AuthError as exc:
+        raise _auth_http_exception(exc) from exc
+    return _to_wallet_quota_response(quota_payload)
+
+
+@app.post("/api/v1/wallet/redeem", response_model=WalletRedeemResponse)
+def redeem_wallet_code(
+    payload: WalletRedeemRequest,
+    principal: AuthPrincipal = Depends(_require_principal),
+) -> WalletRedeemResponse:
+    try:
+        redeemed = auth_service.redeem_code(principal=principal, key=payload.key)
+    except AuthError as exc:
+        raise _auth_http_exception(exc) from exc
+    return WalletRedeemResponse.model_validate(redeemed)
+
+
+@app.get("/api/v1/wallet/packs", response_model=WalletPacksResponse)
+def get_wallet_packs() -> WalletPacksResponse:
+    return _to_wallet_packs_response()
 
 
 @app.get("/api/v1/history-records", response_model=HistoryRecordsResponse)
-def get_history_records() -> HistoryRecordsResponse:
-    records = history_store.list_records()
+def get_history_records(principal: AuthPrincipal = Depends(_require_principal)) -> HistoryRecordsResponse:
+    records = history_store.list_records(user_id=principal.user_id)
     return HistoryRecordsResponse(records=records)
 
 
 @app.put("/api/v1/history-records", response_model=HistoryRecordsSyncResponse)
-def sync_history_records(payload: HistoryRecordsUpsertRequest) -> HistoryRecordsSyncResponse:
+def sync_history_records(
+    payload: HistoryRecordsUpsertRequest,
+    principal: AuthPrincipal = Depends(_require_principal),
+) -> HistoryRecordsSyncResponse:
     normalized_records = [item.model_dump() for item in payload.records]
-    saved_count = history_store.replace_all_records(normalized_records)
-    records = history_store.list_records()
+    saved_count = history_store.replace_all_records(normalized_records, user_id=principal.user_id)
+    records = history_store.list_records(user_id=principal.user_id)
     return HistoryRecordsSyncResponse(saved_count=saved_count, records=records)
 
 
 @app.get("/api/v1/reading/sources", response_model=ReadingSourcesResponse)
-def list_reading_sources() -> ReadingSourcesResponse:
-    sources = reading_store.list_sources(limit=300)
+def list_reading_sources(principal: AuthPrincipal = Depends(_require_principal)) -> ReadingSourcesResponse:
+    sources = reading_store.list_sources(user_id=principal.user_id, limit=300)
     return ReadingSourcesResponse.model_validate({"sources": sources})
 
 
 @app.get("/api/v1/profile/settings", response_model=ProfileSettings)
-def get_profile_settings_api() -> ProfileSettings:
-    settings = profile_store.get_profile_settings()
-    normalized = _normalize_profile_settings_payload(settings)
+def get_profile_settings_api(principal: AuthPrincipal = Depends(_require_principal)) -> ProfileSettings:
+    settings = profile_store.get_profile_settings(user_id=principal.user_id)
+    normalized = _to_public_profile_settings_payload(settings)
     return ProfileSettings.model_validate(normalized)
 
 
 @app.put("/api/v1/profile/settings", response_model=ProfileSettings)
-def update_profile_settings_api(payload: ProfileSettingsUpdateRequest) -> ProfileSettings:
+def update_profile_settings_api(
+    payload: ProfileSettingsUpdateRequest,
+    principal: AuthPrincipal = Depends(_require_principal),
+) -> ProfileSettings:
     patch = payload.model_dump(exclude_none=True)
-    updated = profile_store.upsert_profile_settings(patch)
-    normalized = _normalize_profile_settings_payload(updated)
+    for field in ("llm_unified", "llm_listening", "llm_reading"):
+        llm_patch = patch.get(field)
+        if isinstance(llm_patch, dict) and "api_key" in llm_patch:
+            llm_patch.pop("api_key", None)
+    updated = profile_store.upsert_profile_settings(patch, user_id=principal.user_id)
+    normalized = _to_public_profile_settings_payload(updated)
     return ProfileSettings.model_validate(normalized)
 
 
+@app.put("/api/v1/profile/keys", response_model=ProfileKeysUpdateResponse)
+def update_profile_keys_api(
+    payload: ProfileKeysUpdateRequest,
+    principal: AuthPrincipal = Depends(_require_principal),
+) -> ProfileKeysUpdateResponse:
+    patch = payload.model_dump(exclude_none=True)
+    if not patch:
+        return ProfileKeysUpdateResponse(status="ok", updated_fields=[])
+    profile_store.upsert_profile_api_keys(patch, user_id=principal.user_id)
+    return ProfileKeysUpdateResponse(status="ok", updated_fields=sorted(list(patch.keys())))
+
+
 @app.get("/api/v1/reading/history", response_model=ReadingHistoryResponse)
-def get_reading_history(limit: int = 20, offset: int = 0) -> ReadingHistoryResponse:
+def get_reading_history(
+    limit: int = 20,
+    offset: int = 0,
+    principal: AuthPrincipal = Depends(_require_principal),
+) -> ReadingHistoryResponse:
     safe_limit = max(1, min(100, int(limit or 20)))
     safe_offset = max(0, int(offset or 0))
-    items, has_more = reading_store.list_history(limit=safe_limit, offset=safe_offset)
+    items, has_more = reading_store.list_history(user_id=principal.user_id, limit=safe_limit, offset=safe_offset)
     normalized_items = [ReadingHistoryItem.model_validate(item).model_dump() for item in items]
     return ReadingHistoryResponse.model_validate(
         {
@@ -1003,29 +1290,32 @@ def get_reading_history(limit: int = 20, offset: int = 0) -> ReadingHistoryRespo
 
 
 @app.get("/api/v1/reading/versions/{version_id}", response_model=ReadingVersionResponse)
-def get_reading_version(version_id: str) -> ReadingVersionResponse:
-    material = reading_store.get_version(version_id=version_id)
+def get_reading_version(version_id: str, principal: AuthPrincipal = Depends(_require_principal)) -> ReadingVersionResponse:
+    material = reading_store.get_version(user_id=principal.user_id, version_id=version_id)
     if not material:
         raise HTTPException(status_code=404, detail="Reading version not found")
     return ReadingVersionResponse.model_validate({"version": material})
 
 
 @app.delete("/api/v1/reading/versions/{version_id}", response_model=DeleteOperationResponse)
-def delete_reading_version(version_id: str) -> DeleteOperationResponse:
-    deleted_count = reading_store.delete_version(version_id=version_id)
+def delete_reading_version(version_id: str, principal: AuthPrincipal = Depends(_require_principal)) -> DeleteOperationResponse:
+    deleted_count = reading_store.delete_version(user_id=principal.user_id, version_id=version_id)
     if deleted_count <= 0:
         raise HTTPException(status_code=404, detail="Reading version not found")
     return DeleteOperationResponse(status="ok", deleted_count=deleted_count)
 
 
 @app.post("/api/v1/reading/quiz/short-answers/submit", response_model=ReadingShortAnswerSubmitResponse)
-def submit_reading_short_answer(payload: ReadingShortAnswerSubmitRequest) -> ReadingShortAnswerSubmitResponse:
+def submit_reading_short_answer(
+    payload: ReadingShortAnswerSubmitRequest,
+    principal: AuthPrincipal = Depends(_require_principal),
+) -> ReadingShortAnswerSubmitResponse:
     safe_version_id = str(payload.version_id or "").strip()
     safe_question_id = str(payload.question_id or "").strip()
     if not safe_version_id or not safe_question_id:
         raise HTTPException(status_code=400, detail="version_id and question_id are required")
 
-    version = reading_store.get_version(version_id=safe_version_id)
+    version = reading_store.get_version(user_id=principal.user_id, version_id=safe_version_id)
     if not version:
         raise HTTPException(status_code=404, detail="Reading version not found")
 
@@ -1033,8 +1323,12 @@ def submit_reading_short_answer(payload: ReadingShortAnswerSubmitRequest) -> Rea
     if not question:
         raise HTTPException(status_code=404, detail="Short question not found")
 
-    profile_settings = _normalize_profile_settings_payload(profile_store.get_profile_settings())
-    llm_payload = _resolve_profile_llm_payload(profile=profile_settings, scene="reading")
+    profile_settings = _normalize_profile_settings_payload(profile_store.get_profile_settings(user_id=principal.user_id))
+    profile_llm_payload = _resolve_profile_llm_payload(profile=profile_settings, scene="reading")
+    llm_payload = _build_oneapi_user_llm_payload(
+        access_token=principal.access_token,
+        raw_llm=profile_llm_payload,
+    )
     result_payload = grade_short_answer(
         question=str(question.get("question") or ""),
         reference_answer=str(question.get("reference_answer") or ""),
@@ -1045,6 +1339,7 @@ def submit_reading_short_answer(payload: ReadingShortAnswerSubmitRequest) -> Rea
     if isinstance(result_payload, dict):
         llm_usage = result_payload.pop("_llm_usage", {}) if isinstance(result_payload.get("_llm_usage"), dict) else {}
     saved = reading_store.save_short_answer_attempt(
+        user_id=principal.user_id,
         version_id=safe_version_id,
         question_id=safe_question_id,
         answer_text=payload.answer_text,
@@ -1073,12 +1368,18 @@ def submit_reading_short_answer(payload: ReadingShortAnswerSubmitRequest) -> Rea
 
 
 @app.get("/api/v1/reading/quiz/short-answers/history", response_model=ReadingShortAnswerHistoryResponse)
-def get_reading_short_answer_history(version_id: str = "", question_id: str = "", limit: int = 100) -> ReadingShortAnswerHistoryResponse:
+def get_reading_short_answer_history(
+    version_id: str = "",
+    question_id: str = "",
+    limit: int = 100,
+    principal: AuthPrincipal = Depends(_require_principal),
+) -> ReadingShortAnswerHistoryResponse:
     safe_version_id = str(version_id or "").strip()
     if not safe_version_id:
         raise HTTPException(status_code=400, detail="version_id is required")
     safe_limit = max(1, min(500, int(limit or 100)))
     items = reading_store.list_short_answer_attempts(
+        user_id=principal.user_id,
         version_id=safe_version_id,
         question_id=str(question_id or "").strip(),
         limit=safe_limit,
@@ -1087,8 +1388,12 @@ def get_reading_short_answer_history(version_id: str = "", question_id: str = ""
 
 
 @app.delete("/api/v1/reading/quiz/short-answers/history/group", response_model=DeleteOperationResponse)
-def delete_reading_short_answer_group(payload: ReadingShortAnswerHistoryDeleteRequest) -> DeleteOperationResponse:
+def delete_reading_short_answer_group(
+    payload: ReadingShortAnswerHistoryDeleteRequest,
+    principal: AuthPrincipal = Depends(_require_principal),
+) -> DeleteOperationResponse:
     deleted_count = reading_store.delete_short_answer_group(
+        user_id=principal.user_id,
         version_id=payload.version_id,
         question_id=payload.question_id,
     )
@@ -1101,16 +1406,18 @@ def get_reading_material(
     srt_name: str = "",
     user_level: str = "cet4",
     version_id: str = "",
+    principal: AuthPrincipal = Depends(_require_principal),
 ) -> ReadingMaterialResponse:
     safe_version_id = (version_id or "").strip()
     safe_level = (user_level or "cet4").strip().lower() or "cet4"
     material = None
     if safe_version_id:
-        material = reading_store.get_version(version_id=safe_version_id)
+        material = reading_store.get_version(user_id=principal.user_id, version_id=safe_version_id)
     else:
         if not str(video_name or "").strip() or not str(srt_name or "").strip():
             raise HTTPException(status_code=400, detail="video_name and srt_name are required when version_id is absent")
         material = reading_store.get_material(
+            user_id=principal.user_id,
             video_name=video_name,
             srt_name=srt_name,
             user_level=safe_level,
@@ -1122,29 +1429,24 @@ def get_reading_material(
 
 
 @app.post("/api/v1/reading/materials/generate", response_model=ReadingMaterialResponse)
-def generate_reading_material_api(payload: ReadingMaterialGenerateRequest) -> ReadingMaterialResponse:
-    source = reading_store.get_source(video_name=payload.video_name, srt_name=payload.srt_name)
+def generate_reading_material_api(
+    payload: ReadingMaterialGenerateRequest,
+    principal: AuthPrincipal = Depends(_require_principal),
+) -> ReadingMaterialResponse:
+    source = reading_store.get_source(user_id=principal.user_id, video_name=payload.video_name, srt_name=payload.srt_name)
     if not source:
         raise HTTPException(status_code=404, detail="Reading source not found")
 
-    profile_settings = _normalize_profile_settings_payload(profile_store.get_profile_settings())
-    llm_payload_raw = payload.llm.model_dump() if payload.llm else _resolve_profile_llm_payload(
-        profile=profile_settings,
-        scene="reading",
+    requested_llm = payload.llm.model_dump() if payload.llm else None
+    llm_payload = _build_oneapi_user_llm_payload(
+        access_token=principal.access_token,
+        raw_llm=requested_llm if isinstance(requested_llm, dict) else None,
     )
-    llm_payload = _sanitize_llm_options_payload(llm_payload_raw)
-    if not _is_llm_payload_ready(llm_payload):
-        raise HTTPException(
-            status_code=400,
-            detail={
-                "code": "reading_llm_required",
-                "message": "阅读生成需要可用的 LLM 配置，请前往个人中心配置阅读 LLM。",
-            },
-        )
     llm_signature = _build_reading_llm_signature(llm_payload)
 
     if not payload.force_regenerate:
         cached = reading_store.get_material(
+            user_id=principal.user_id,
             video_name=payload.video_name,
             srt_name=payload.srt_name,
             user_level=payload.user_level,
@@ -1172,6 +1474,7 @@ def generate_reading_material_api(payload: ReadingMaterialGenerateRequest) -> Re
     latest_version = None
     if payload.scope != "all":
         latest_version = reading_store.get_latest_version_by_source(
+            user_id=principal.user_id,
             video_name=payload.video_name,
             srt_name=payload.srt_name,
         )
@@ -1229,6 +1532,7 @@ def generate_reading_material_api(payload: ReadingMaterialGenerateRequest) -> Re
     config_payload[READING_CACHE_LLM_SIGNATURE_KEY] = llm_signature
 
     saved = reading_store.save_material(
+        user_id=principal.user_id,
         source_id=int(source.get("id") or 0),
         user_level=payload.user_level,
         scope=payload.scope,
@@ -1270,6 +1574,7 @@ def generate_reading_material_api(payload: ReadingMaterialGenerateRequest) -> Re
 async def create_subtitle_job(
     video_file: UploadFile = File(...),
     options_json: str = Form(default="{}"),
+    principal: AuthPrincipal = Depends(_require_principal),
 ) -> JobCreateResponse:
     if not video_file.filename:
         raise HTTPException(status_code=400, detail="video_file filename is required")
@@ -1281,12 +1586,14 @@ async def create_subtitle_job(
 
     options = SubtitleJobOptions.model_validate(raw_options)
     options_dict = _validate_subtitle_job_options(options)
+    options_dict = _inject_job_llm_options_from_principal(options=options_dict, principal=principal)
 
-    active_job = job_manager.find_active_job()
-    if active_job:
+    capacity = job_manager.check_submit_capacity(user_id=principal.user_id)
+    if not bool(capacity.get("ok")):
         await video_file.close()
-        detail = _build_active_job_exists_detail(active_job)
-        raise HTTPException(status_code=409, detail=detail)
+        code = str(capacity.get("code") or "")
+        status_code = 409 if code == "user_concurrency_limit" else 429
+        raise HTTPException(status_code=status_code, detail=capacity)
 
     job_id = uuid.uuid4().hex
     work_dir = RUNTIME_JOBS_ROOT / job_id
@@ -1306,6 +1613,7 @@ async def create_subtitle_job(
         await video_file.close()
 
     record = job_manager.create_job(
+        user_id=principal.user_id,
         video_path=str(video_path),
         options=options_dict,
         job_id=job_id,
@@ -1317,18 +1625,33 @@ async def create_subtitle_job(
 
 
 @app.post("/api/v1/subtitle-jobs/from-url", response_model=JobCreateResponse)
-def create_subtitle_job_from_url(payload: SubtitleJobFromUrlRequest) -> JobCreateResponse:
+def create_subtitle_job_from_url(
+    payload: SubtitleJobFromUrlRequest,
+    principal: AuthPrincipal = Depends(_require_principal),
+) -> JobCreateResponse:
+    policy = evaluate_source_url_policy(payload.url)
+    if not bool(policy.get("allowed")):
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": "source_url_not_allowed",
+                "message": str(policy.get("reason") or "不允许的来源链接"),
+                "source_url_policy": policy,
+            },
+        )
     try:
-        safe_url = normalize_source_url(payload.url)
+        safe_url = normalize_source_url(str(policy.get("normalized_url") or payload.url))
     except PipelineError as exc:
         raise HTTPException(status_code=400, detail=exc.message) from exc
 
     options_dict = _validate_subtitle_job_options(payload.options)
+    options_dict = _inject_job_llm_options_from_principal(options=options_dict, principal=principal)
 
-    active_job = job_manager.find_active_job()
-    if active_job:
-        detail = _build_active_job_exists_detail(active_job)
-        raise HTTPException(status_code=409, detail=detail)
+    capacity = job_manager.check_submit_capacity(user_id=principal.user_id)
+    if not bool(capacity.get("ok")):
+        code = str(capacity.get("code") or "")
+        status_code = 409 if code == "user_concurrency_limit" else 429
+        raise HTTPException(status_code=status_code, detail=capacity)
 
     job_id = uuid.uuid4().hex
     work_dir = RUNTIME_JOBS_ROOT / job_id
@@ -1336,6 +1659,7 @@ def create_subtitle_job_from_url(payload: SubtitleJobFromUrlRequest) -> JobCreat
     input_dir.mkdir(parents=True, exist_ok=True)
 
     record = job_manager.create_url_job(
+        user_id=principal.user_id,
         source_url=safe_url,
         options=options_dict,
         job_id=job_id,
@@ -1343,42 +1667,51 @@ def create_subtitle_job_from_url(payload: SubtitleJobFromUrlRequest) -> JobCreat
         enqueue=False,
     )
     job_manager.enqueue(record.job_id)
-    return JobCreateResponse(job_id=record.job_id, status="queued")
+    return JobCreateResponse.model_validate(
+        {
+            "job_id": record.job_id,
+            "status": "queued",
+            "source_url_policy": policy,
+        }
+    )
 
 
 @app.post("/api/v1/subtitle-jobs/resume-llm", response_model=JobCreateResponse)
-def resume_subtitle_job() -> JobCreateResponse:
+def resume_subtitle_job(principal: AuthPrincipal = Depends(_require_principal)) -> JobCreateResponse:
+    _ = principal
     raise HTTPException(status_code=410, detail=_deprecated_simplified_only_detail())
 
 
 @app.post("/api/v1/subtitle-jobs/continue", response_model=JobCreateResponse)
-def continue_subtitle_job() -> JobCreateResponse:
+def continue_subtitle_job(principal: AuthPrincipal = Depends(_require_principal)) -> JobCreateResponse:
+    _ = principal
     raise HTTPException(status_code=410, detail=_deprecated_simplified_only_detail())
 
 
 @app.post("/api/v1/subtitle-jobs/{job_id}/retry-alignment", response_model=JobCreateResponse)
-def retry_subtitle_job_alignment(job_id: str) -> JobCreateResponse:
+def retry_subtitle_job_alignment(job_id: str, principal: AuthPrincipal = Depends(_require_principal)) -> JobCreateResponse:
     _ = job_id
+    _ = principal
     raise HTTPException(status_code=410, detail=_deprecated_simplified_only_detail())
 
 
 @app.get("/api/v1/subtitle-jobs/{job_id}", response_model=JobStatusResponse)
-def get_job_status(job_id: str) -> JobStatusResponse:
-    record = job_manager.get_status(job_id)
+def get_job_status(job_id: str, principal: AuthPrincipal = Depends(_require_principal)) -> JobStatusResponse:
+    record = job_manager.get_status(job_id, user_id=principal.user_id)
     if not record:
         raise HTTPException(status_code=404, detail="Job not found")
     return JobStatusResponse.model_validate(job_manager.serialize_status(record))
 
 
 @app.get("/api/v1/subtitle-jobs/{job_id}/result")
-def get_job_result(job_id: str) -> dict:
-    record = job_manager.get_status(job_id)
+def get_job_result(job_id: str, principal: AuthPrincipal = Depends(_require_principal)) -> dict:
+    record = job_manager.get_status(job_id, user_id=principal.user_id)
     if not record:
         raise HTTPException(status_code=404, detail="Job not found")
     if record.status != "completed":
         raise HTTPException(status_code=409, detail=f"Job not completed yet, current status: {record.status}")
 
-    payload = job_manager.consume_result(job_id)
+    payload = job_manager.consume_result(job_id, user_id=principal.user_id)
     if not payload:
         raise HTTPException(status_code=404, detail="Result not found")
     if isinstance(payload, dict) and not isinstance(payload.get("diagnostics"), dict):
@@ -1395,8 +1728,8 @@ def get_job_result(job_id: str) -> dict:
 
 
 @app.get("/api/v1/subtitle-jobs/{job_id}/video")
-def get_job_video(job_id: str):
-    record = job_manager.get_status(job_id)
+def get_job_video(job_id: str, principal: AuthPrincipal = Depends(_require_principal)):
+    record = job_manager.get_status(job_id, user_id=principal.user_id)
     if not record:
         raise HTTPException(status_code=404, detail="Job not found")
     if record.source_mode != "url":
@@ -1421,8 +1754,8 @@ def get_job_video(job_id: str):
 
 
 @app.delete("/api/v1/subtitle-jobs/{job_id}")
-def delete_job(job_id: str) -> dict:
-    payload = job_manager.delete_job(job_id)
+def delete_job(job_id: str, principal: AuthPrincipal = Depends(_require_principal)) -> dict:
+    payload = job_manager.delete_job(job_id, user_id=principal.user_id)
     if not payload:
         raise HTTPException(status_code=404, detail="Job not found")
     return payload

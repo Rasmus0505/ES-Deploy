@@ -3,8 +3,13 @@ import {
   DEFAULT_LLM_BASE_URL,
   DEFAULT_LLM_MODEL
 } from '../api/provider-presets';
-import { fetchProfileSettings, updateProfileSettings } from '../api/profile';
-import type { LlmOptions, ProfileSettings, ProfileSettingsUpdateRequest } from '../../types/backend';
+import { fetchProfileSettings, updateProfileKeys, updateProfileSettings } from '../api/profile';
+import type {
+  LlmOptions,
+  ProfileKeysUpdateRequest,
+  ProfileSettings,
+  ProfileSettingsUpdateRequest
+} from '../../types/backend';
 
 const ENGLISH_LEVELS = new Set(['junior', 'senior', 'cet4', 'cet6', 'kaoyan', 'toefl', 'sat']);
 const LISTENING_TRANSLATION_MODE_STORAGE_KEY = 'profileListeningTranslationModeV1';
@@ -13,11 +18,33 @@ const DEFAULT_TRANSLATION_MODEL_BASE_URL = 'https://dashscope.aliyuncs.com/compa
 const DEFAULT_TRANSLATION_MODEL = 'qwen-mt-flash';
 
 export type ListeningTranslationMode = 'llm_model' | 'translation_model';
-export type ExtendedProfileSettings = ProfileSettings & {
+export type ExtendedProfileSettings = {
+  english_level: ProfileSettings['english_level'];
+  english_level_numeric: number;
+  english_level_cefr: string;
+  llm_mode: ProfileSettings['llm_mode'];
+  llm_unified: LlmOptions;
+  llm_listening: LlmOptions;
+  llm_reading: LlmOptions;
+  llm_unified_has_api_key: boolean;
+  llm_listening_has_api_key: boolean;
+  llm_reading_has_api_key: boolean;
+  llm_unified_api_key_masked: string;
+  llm_listening_api_key_masked: string;
+  llm_reading_api_key_masked: string;
+  updated_at: number;
   listening_translation_mode: ListeningTranslationMode;
   listening_translation_model: LlmOptions;
 };
-type ProfileLike = Partial<ProfileSettings> & {
+type ProfileLike = {
+  english_level?: ProfileSettings['english_level'] | string;
+  english_level_numeric?: number;
+  english_level_cefr?: string;
+  llm_mode?: ProfileSettings['llm_mode'] | string;
+  llm_unified?: Record<string, unknown> | Partial<LlmOptions> | null;
+  llm_listening?: Record<string, unknown> | Partial<LlmOptions> | null;
+  llm_reading?: Record<string, unknown> | Partial<LlmOptions> | null;
+  updated_at?: number;
   listening_translation_mode?: ListeningTranslationMode | string;
   listening_translation_model?: Partial<LlmOptions> | null;
 };
@@ -52,6 +79,12 @@ export const DEFAULT_PROFILE_SETTINGS: ExtendedProfileSettings = {
     model: DEFAULT_LLM_MODEL,
     llm_support_json: false
   },
+  llm_unified_has_api_key: false,
+  llm_listening_has_api_key: false,
+  llm_reading_has_api_key: false,
+  llm_unified_api_key_masked: '',
+  llm_listening_api_key_masked: '',
+  llm_reading_api_key_masked: '',
   listening_translation_mode: 'llm_model',
   listening_translation_model: DEFAULT_TRANSLATION_MODEL_OPTIONS,
   updated_at: 0
@@ -95,6 +128,36 @@ function normalizeTranslationModelOptions(value: Partial<LlmOptions> | null | un
   return normalizeLlmOptions(value, DEFAULT_TRANSLATION_MODEL_BASE_URL, DEFAULT_TRANSLATION_MODEL);
 }
 
+function normalizePublicLlmMetadata(value: unknown): { has_api_key: boolean; api_key_masked: string } {
+  if (!value || typeof value !== 'object') {
+    return { has_api_key: false, api_key_masked: '' };
+  }
+  const safe = value as Record<string, unknown>;
+  return {
+    has_api_key: Boolean(safe.has_api_key),
+    api_key_masked: String(safe.api_key_masked || '').trim()
+  };
+}
+
+function toLlmUpdatePayload(value: Partial<LlmOptions> | null | undefined) {
+  const safe = normalizeLlmOptions(value || {});
+  return {
+    base_url: safe.base_url,
+    model: safe.model,
+    llm_support_json: Boolean(safe.llm_support_json)
+  };
+}
+
+function sanitizeProfileUpdateRequest(updates: ProfileSettingsUpdateRequest): ProfileSettingsUpdateRequest {
+  const payload: ProfileSettingsUpdateRequest = {};
+  if (updates.english_level) payload.english_level = updates.english_level;
+  if (updates.llm_mode) payload.llm_mode = updates.llm_mode;
+  if (updates.llm_unified) payload.llm_unified = toLlmUpdatePayload(updates.llm_unified as Partial<LlmOptions>);
+  if (updates.llm_listening) payload.llm_listening = toLlmUpdatePayload(updates.llm_listening as Partial<LlmOptions>);
+  if (updates.llm_reading) payload.llm_reading = toLlmUpdatePayload(updates.llm_reading as Partial<LlmOptions>);
+  return payload;
+}
+
 function readListeningTranslationModeFromStorage(): ListeningTranslationMode {
   const raw = readStorageString(LISTENING_TRANSLATION_MODE_STORAGE_KEY, 'llm_model').trim().toLowerCase();
   return raw === 'translation_model' ? 'translation_model' : 'llm_model';
@@ -117,8 +180,9 @@ export function saveListeningTranslationLocalSettings(settings: {
 }) {
   const safeMode: ListeningTranslationMode = settings.mode === 'translation_model' ? 'translation_model' : 'llm_model';
   const safeModel = normalizeTranslationModelOptions(settings.model);
+  const persistedModel = { ...safeModel, api_key: '' };
   writeStorageString(LISTENING_TRANSLATION_MODE_STORAGE_KEY, safeMode);
-  writeStorageString(LISTENING_TRANSLATION_MODEL_STORAGE_KEY, JSON.stringify(safeModel));
+  writeStorageString(LISTENING_TRANSLATION_MODEL_STORAGE_KEY, JSON.stringify(persistedModel));
   return {
     listening_translation_mode: safeMode,
     listening_translation_model: safeModel
@@ -129,6 +193,18 @@ export function normalizeProfileSettings(value: ProfileLike | null | undefined):
   const safe = value || {};
   const englishLevel = String(safe.english_level || '').trim().toLowerCase();
   const llmMode = String(safe.llm_mode || '').trim().toLowerCase();
+  const llmUnifiedRaw = safe.llm_unified && typeof safe.llm_unified === 'object'
+    ? (safe.llm_unified as Record<string, unknown>)
+    : {};
+  const llmListeningRaw = safe.llm_listening && typeof safe.llm_listening === 'object'
+    ? (safe.llm_listening as Record<string, unknown>)
+    : {};
+  const llmReadingRaw = safe.llm_reading && typeof safe.llm_reading === 'object'
+    ? (safe.llm_reading as Record<string, unknown>)
+    : {};
+  const llmUnifiedMeta = normalizePublicLlmMetadata(safe.llm_unified);
+  const llmListeningMeta = normalizePublicLlmMetadata(safe.llm_listening);
+  const llmReadingMeta = normalizePublicLlmMetadata(safe.llm_reading);
   const localTranslationMode = readListeningTranslationModeFromStorage();
   const localTranslationModel = readListeningTranslationModelFromStorage();
   const rawTranslationMode = String(safe.listening_translation_mode || localTranslationMode || 'llm_model').trim().toLowerCase();
@@ -138,9 +214,15 @@ export function normalizeProfileSettings(value: ProfileLike | null | undefined):
     english_level_numeric: Number(safe.english_level_numeric || DEFAULT_PROFILE_SETTINGS.english_level_numeric),
     english_level_cefr: String(safe.english_level_cefr || '').trim() || DEFAULT_PROFILE_SETTINGS.english_level_cefr,
     llm_mode: (llmMode === 'custom' ? 'custom' : 'unified') as ProfileSettings['llm_mode'],
-    llm_unified: normalizeLlmOptions(safe.llm_unified),
-    llm_listening: normalizeLlmOptions(safe.llm_listening),
-    llm_reading: normalizeLlmOptions(safe.llm_reading),
+    llm_unified: normalizeLlmOptions({ ...llmUnifiedRaw, api_key: '' }),
+    llm_listening: normalizeLlmOptions({ ...llmListeningRaw, api_key: '' }),
+    llm_reading: normalizeLlmOptions({ ...llmReadingRaw, api_key: '' }),
+    llm_unified_has_api_key: llmUnifiedMeta.has_api_key,
+    llm_listening_has_api_key: llmListeningMeta.has_api_key,
+    llm_reading_has_api_key: llmReadingMeta.has_api_key,
+    llm_unified_api_key_masked: llmUnifiedMeta.api_key_masked,
+    llm_listening_api_key_masked: llmListeningMeta.api_key_masked,
+    llm_reading_api_key_masked: llmReadingMeta.api_key_masked,
     listening_translation_mode: listeningTranslationMode,
     listening_translation_model: normalizeTranslationModelOptions(
       safe.listening_translation_model || localTranslationModel || DEFAULT_TRANSLATION_MODEL_OPTIONS
@@ -184,12 +266,29 @@ export function useProfileSettings() {
   const save = useCallback(
     async (updates: ProfileSettingsUpdateRequest) => {
       setError('');
-      const payload = await updateProfileSettings(updates);
+      const payload = await updateProfileSettings(sanitizeProfileUpdateRequest(updates));
       const normalized = normalizeProfileSettings(payload);
       setProfile(normalized);
       return normalized;
     },
     []
+  );
+
+  const saveApiKeys = useCallback(
+    async (updates: ProfileKeysUpdateRequest) => {
+      setError('');
+      const payload: ProfileKeysUpdateRequest = {};
+      if (updates.llm_unified_api_key !== undefined) payload.llm_unified_api_key = String(updates.llm_unified_api_key || '');
+      if (updates.llm_listening_api_key !== undefined) payload.llm_listening_api_key = String(updates.llm_listening_api_key || '');
+      if (updates.llm_reading_api_key !== undefined) payload.llm_reading_api_key = String(updates.llm_reading_api_key || '');
+      if (Object.keys(payload).length === 0) {
+        return { status: 'ok' as const, updated_fields: [] as string[] };
+      }
+      const response = await updateProfileKeys(payload);
+      await refresh();
+      return response;
+    },
+    [refresh]
   );
 
   const saveListeningTranslationSettings = useCallback(
@@ -213,6 +312,7 @@ export function useProfileSettings() {
     error,
     refresh,
     save,
+    saveApiKeys,
     saveListeningTranslationSettings
   };
 }

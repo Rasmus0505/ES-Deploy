@@ -1,4 +1,5 @@
 import { getApiBase } from './base';
+import { clearAuthToken, getAuthToken } from './auth-token';
 
 const API_BASE = getApiBase();
 
@@ -81,6 +82,10 @@ async function parsePayload(response: Response) {
 
 function buildRequestInit(options: RequestOptions): RequestInit {
   const headers = new Headers(options.headers || {});
+  const token = getAuthToken();
+  if (token && !headers.has('Authorization')) {
+    headers.set('Authorization', `Bearer ${token}`);
+  }
   const init: RequestInit = {
     method: options.method || 'GET',
     headers,
@@ -114,6 +119,9 @@ async function request(path: string, options: RequestOptions = {}) {
       if (!response.ok) {
         const payload = await parsePayload(response);
         const message = extractPayloadMessage(payload) || `HTTP ${response.status}`;
+        if (response.status === 401) {
+          clearAuthToken();
+        }
         const error = new ApiRequestError(message, response.status, payload);
         if (response.status >= 500 && attempt < retry) {
           await sleep(retryDelayMs * (attempt + 1));

@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import json
 import queue
+import sqlite3
 import threading
+import time
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -25,6 +27,22 @@ def _iso(value: datetime | None) -> str | None:
     if value is None:
         return None
     return value.isoformat().replace("+00:00", "Z")
+
+
+def _to_ms(value: datetime | None) -> int:
+    if value is None:
+        return 0
+    return max(0, int(round(value.timestamp() * 1000)))
+
+
+def _from_ms(value: Any) -> datetime | None:
+    try:
+        parsed = int(value or 0)
+    except Exception:
+        parsed = 0
+    if parsed <= 0:
+        return None
+    return datetime.fromtimestamp(parsed / 1000, tz=timezone.utc)
 
 
 def _load_json(path: Path) -> dict | None:
@@ -159,6 +177,7 @@ _POLL_INTERVAL_MS_HINT = 800
 @dataclass
 class JobRecord:
     job_id: str
+    user_id: str
     work_dir: str
     video_path: str
     options: dict
@@ -197,24 +216,222 @@ class JobRecord:
 
 
 class SubtitleJobManager:
-    def __init__(self, runtime_root: str):
+    def __init__(
+        self,
+        runtime_root: str,
+        *,
+        db_path: str,
+        global_concurrency_limit: int = 3,
+        per_user_concurrency_limit: int = 1,
+    ):
         self.runtime_root = Path(runtime_root)
         self.runtime_root.mkdir(parents=True, exist_ok=True)
+        self._db_path = Path(db_path)
+        self._db_path.parent.mkdir(parents=True, exist_ok=True)
+        self._global_concurrency_limit = max(1, int(global_concurrency_limit or 1))
+        self._per_user_concurrency_limit = max(1, int(per_user_concurrency_limit or 1))
         self._jobs: dict[str, JobRecord] = {}
         self._queue: queue.Queue[str] = queue.Queue()
         self._lock = threading.RLock()
-        self._worker: threading.Thread | None = None
+        self._workers: list[threading.Thread] = []
+        self._active_by_user: dict[str, int] = {}
+        self._active_jobs_total = 0
+        self._init_db()
         with self._lock:
+            self._load_jobs_from_db_locked()
             self._ensure_worker_alive_locked()
 
+    def _connect(self) -> sqlite3.Connection:
+        connection = sqlite3.connect(str(self._db_path), timeout=30, check_same_thread=False)
+        connection.row_factory = sqlite3.Row
+        return connection
+
+    def _init_db(self) -> None:
+        with self._connect() as connection:
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS subtitle_jobs (
+                    job_id TEXT PRIMARY KEY,
+                    user_id TEXT NOT NULL,
+                    payload_json TEXT NOT NULL DEFAULT '{}',
+                    created_at INTEGER NOT NULL DEFAULT 0,
+                    updated_at INTEGER NOT NULL DEFAULT 0
+                )
+                """
+            )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS idx_subtitle_jobs_user_updated ON subtitle_jobs(user_id, updated_at DESC)"
+            )
+            connection.commit()
+
+    def _record_to_persistence_payload(self, record: JobRecord) -> dict[str, Any]:
+        return {
+            "job_id": record.job_id,
+            "user_id": record.user_id,
+            "work_dir": record.work_dir,
+            "video_path": record.video_path,
+            "options": record.options if isinstance(record.options, dict) else {},
+            "job_kind": record.job_kind,
+            "source_mode": record.source_mode,
+            "source_url": record.source_url,
+            "resume_sentences": record.resume_sentences if isinstance(record.resume_sentences, list) else [],
+            "resume_word_segments": record.resume_word_segments if isinstance(record.resume_word_segments, list) else [],
+            "status": record.status,
+            "progress_percent": int(record.progress_percent or 0),
+            "current_stage": record.current_stage,
+            "message": record.message,
+            "error": record.error,
+            "error_code": record.error_code,
+            "error_detail": record.error_detail if isinstance(record.error_detail, dict) else None,
+            "created_at_ms": _to_ms(record.created_at),
+            "started_at_ms": _to_ms(record.started_at),
+            "updated_at_ms": _to_ms(record.updated_at),
+            "completed_at_ms": _to_ms(record.completed_at),
+            "result": record.result if isinstance(record.result, dict) else None,
+            "result_consumed": bool(record.result_consumed),
+            "partial_result": record.partial_result if isinstance(record.partial_result, dict) else None,
+            "cancel_requested": bool(record.cancel_requested),
+            "whisper_runtime": record.whisper_runtime,
+            "whisper_model_requested": record.whisper_model_requested,
+            "whisper_model_effective": record.whisper_model_effective,
+            "asr_provider_effective": record.asr_provider_effective,
+            "asr_fallback_used": bool(record.asr_fallback_used),
+            "stage_durations_ms": record.stage_durations_ms if isinstance(record.stage_durations_ms, dict) else {},
+            "stage_order": record.stage_order if isinstance(record.stage_order, list) else [],
+            "stage_started_at_ms": _to_ms(record.stage_started_at),
+            "stage_detail": record.stage_detail if isinstance(record.stage_detail, dict) else {},
+            "recent_progress_events": record.recent_progress_events if isinstance(record.recent_progress_events, list) else [],
+            "status_revision": int(record.status_revision or 0),
+            "sync_diagnostics": record.sync_diagnostics if isinstance(record.sync_diagnostics, dict) else {},
+        }
+
+    @staticmethod
+    def _payload_to_record(payload: dict[str, Any]) -> JobRecord | None:
+        if not isinstance(payload, dict):
+            return None
+        job_id = str(payload.get("job_id") or "").strip()
+        user_id = str(payload.get("user_id") or "").strip() or "legacy"
+        work_dir = str(payload.get("work_dir") or "").strip()
+        if not job_id or not work_dir:
+            return None
+        created_at = _from_ms(payload.get("created_at_ms")) or _now()
+        updated_at = _from_ms(payload.get("updated_at_ms")) or created_at
+        status = str(payload.get("status") or "queued").strip().lower() or "queued"
+        if status in {"queued", "running"}:
+            status = "failed"
+            payload["error_code"] = "service_restarted"
+            payload["error"] = str(payload.get("error") or "服务重启后任务中断")
+            payload["message"] = "服务重启后任务中断，请重新创建任务"
+        return JobRecord(
+            job_id=job_id,
+            user_id=user_id,
+            work_dir=work_dir,
+            video_path=str(payload.get("video_path") or ""),
+            options=payload.get("options") if isinstance(payload.get("options"), dict) else {},
+            job_kind=str(payload.get("job_kind") or "full"),
+            source_mode=str(payload.get("source_mode") or "file"),
+            source_url=str(payload.get("source_url") or ""),
+            resume_sentences=payload.get("resume_sentences") if isinstance(payload.get("resume_sentences"), list) else [],
+            resume_word_segments=(
+                payload.get("resume_word_segments") if isinstance(payload.get("resume_word_segments"), list) else []
+            ),
+            status=status,
+            progress_percent=max(0, min(100, int(payload.get("progress_percent") or 0))),
+            current_stage=str(payload.get("current_stage") or "queued"),
+            message=str(payload.get("message") or ""),
+            error=str(payload.get("error") or "").strip() or None,
+            error_code=str(payload.get("error_code") or ""),
+            error_detail=payload.get("error_detail") if isinstance(payload.get("error_detail"), dict) else None,
+            created_at=created_at,
+            started_at=_from_ms(payload.get("started_at_ms")),
+            updated_at=updated_at,
+            completed_at=_from_ms(payload.get("completed_at_ms")),
+            result=payload.get("result") if isinstance(payload.get("result"), dict) else None,
+            result_consumed=bool(payload.get("result_consumed")),
+            partial_result=payload.get("partial_result") if isinstance(payload.get("partial_result"), dict) else None,
+            cancel_requested=bool(payload.get("cancel_requested")),
+            whisper_runtime=str(payload.get("whisper_runtime") or ""),
+            whisper_model_requested=str(payload.get("whisper_model_requested") or ""),
+            whisper_model_effective=str(payload.get("whisper_model_effective") or ""),
+            asr_provider_effective=str(payload.get("asr_provider_effective") or ""),
+            asr_fallback_used=bool(payload.get("asr_fallback_used")),
+            stage_durations_ms=payload.get("stage_durations_ms") if isinstance(payload.get("stage_durations_ms"), dict) else {},
+            stage_order=payload.get("stage_order") if isinstance(payload.get("stage_order"), list) else [],
+            stage_started_at=_from_ms(payload.get("stage_started_at_ms")),
+            stage_detail=payload.get("stage_detail") if isinstance(payload.get("stage_detail"), dict) else {},
+            recent_progress_events=(
+                payload.get("recent_progress_events") if isinstance(payload.get("recent_progress_events"), list) else []
+            ),
+            status_revision=max(0, int(payload.get("status_revision") or 0)),
+            sync_diagnostics=payload.get("sync_diagnostics") if isinstance(payload.get("sync_diagnostics"), dict) else {},
+        )
+
+    def _persist_record_locked(self, record: JobRecord) -> None:
+        payload_json = json.dumps(self._record_to_persistence_payload(record), ensure_ascii=False)
+        now_ms = _to_ms(_now())
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO subtitle_jobs(job_id, user_id, payload_json, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(job_id) DO UPDATE SET
+                    user_id=excluded.user_id,
+                    payload_json=excluded.payload_json,
+                    updated_at=excluded.updated_at
+                """,
+                (
+                    record.job_id,
+                    record.user_id,
+                    payload_json,
+                    _to_ms(record.created_at),
+                    now_ms,
+                ),
+            )
+            connection.commit()
+
+    def _delete_record_locked(self, *, job_id: str) -> None:
+        with self._connect() as connection:
+            connection.execute("DELETE FROM subtitle_jobs WHERE job_id=?", (job_id,))
+            connection.commit()
+
+    def _load_jobs_from_db_locked(self) -> None:
+        with self._connect() as connection:
+            rows = connection.execute("SELECT payload_json FROM subtitle_jobs ORDER BY updated_at DESC").fetchall()
+        for row in rows:
+            try:
+                payload = json.loads(str(row["payload_json"] or "{}"))
+            except Exception:
+                continue
+            record = self._payload_to_record(payload)
+            if not record:
+                continue
+            self._jobs[record.job_id] = record
+            self._persist_record_locked(record)
+
     def _start_worker_locked(self) -> None:
-        self._worker = threading.Thread(target=self._worker_loop, daemon=True, name="subtitle-job-worker")
-        self._worker.start()
+        worker_index = len(self._workers) + 1
+        thread = threading.Thread(target=self._worker_loop, daemon=True, name=f"subtitle-job-worker-{worker_index}")
+        thread.start()
+        self._workers.append(thread)
 
     def _ensure_worker_alive_locked(self) -> None:
-        if self._worker and self._worker.is_alive():
-            return
-        self._start_worker_locked()
+        alive = [worker for worker in self._workers if worker.is_alive()]
+        self._workers = alive
+        while len(self._workers) < self._global_concurrency_limit:
+            self._start_worker_locked()
+
+    @staticmethod
+    def _normalize_user_id(user_id: str | None) -> str:
+        safe = str(user_id or "").strip()
+        return safe or "legacy"
+
+    def _can_start_job_locked(self, record: JobRecord) -> bool:
+        if self._active_jobs_total >= self._global_concurrency_limit:
+            return False
+        active_by_user = int(self._active_by_user.get(record.user_id, 0))
+        if active_by_user >= self._per_user_concurrency_limit:
+            return False
+        return True
 
     @staticmethod
     def _normalize_stage(stage: str | None, fallback: str = "queued") -> str:
@@ -476,6 +693,7 @@ class SubtitleJobManager:
 
     def create_job(
         self,
+        user_id: str,
         video_path: str,
         options: dict,
         *,
@@ -485,8 +703,10 @@ class SubtitleJobManager:
     ) -> JobRecord:
         job_id = job_id or uuid.uuid4().hex
         work_dir = work_dir or str(self.runtime_root / job_id)
+        safe_user_id = self._normalize_user_id(user_id)
         record = JobRecord(
             job_id=job_id,
+            user_id=safe_user_id,
             work_dir=work_dir,
             video_path=video_path,
             options=options,
@@ -507,6 +727,7 @@ class SubtitleJobManager:
             self._ensure_worker_alive_locked()
             self._init_stage_tracking_locked(record)
             self._jobs[job_id] = record
+            self._persist_record_locked(record)
             if enqueue:
                 self._queue.put(job_id)
         return record
@@ -514,6 +735,7 @@ class SubtitleJobManager:
     def create_url_job(
         self,
         *,
+        user_id: str,
         source_url: str,
         options: dict,
         job_id: str | None = None,
@@ -522,8 +744,10 @@ class SubtitleJobManager:
     ) -> JobRecord:
         job_id = job_id or uuid.uuid4().hex
         work_dir = work_dir or str(self.runtime_root / job_id)
+        safe_user_id = self._normalize_user_id(user_id)
         record = JobRecord(
             job_id=job_id,
+            user_id=safe_user_id,
             work_dir=work_dir,
             video_path="",
             source_url=source_url,
@@ -545,6 +769,7 @@ class SubtitleJobManager:
             self._ensure_worker_alive_locked()
             self._init_stage_tracking_locked(record)
             self._jobs[job_id] = record
+            self._persist_record_locked(record)
             if enqueue:
                 self._queue.put(job_id)
         return record
@@ -552,6 +777,7 @@ class SubtitleJobManager:
     def create_llm_resume_job(
         self,
         *,
+        user_id: str,
         sentences: list[dict],
         word_segments: list[dict],
         options: dict,
@@ -561,8 +787,10 @@ class SubtitleJobManager:
     ) -> JobRecord:
         job_id = job_id or uuid.uuid4().hex
         work_dir = work_dir or str(self.runtime_root / job_id)
+        safe_user_id = self._normalize_user_id(user_id)
         record = JobRecord(
             job_id=job_id,
+            user_id=safe_user_id,
             work_dir=work_dir,
             video_path="",
             options=options,
@@ -585,6 +813,7 @@ class SubtitleJobManager:
             self._ensure_worker_alive_locked()
             self._init_stage_tracking_locked(record)
             self._jobs[job_id] = record
+            self._persist_record_locked(record)
             if enqueue:
                 self._queue.put(job_id)
         return record
@@ -599,42 +828,86 @@ class SubtitleJobManager:
                 return
             self._queue.put(job_id)
 
-    def get_status(self, job_id: str) -> JobRecord | None:
+    def get_status(self, job_id: str, *, user_id: str | None = None) -> JobRecord | None:
+        safe_user_id = self._normalize_user_id(user_id)
         with self._lock:
             self._ensure_worker_alive_locked()
             self._cleanup_expired_locked()
-            return self._jobs.get(job_id)
+            record = self._jobs.get(job_id)
+            if not record:
+                return None
+            if user_id is not None and record.user_id != safe_user_id:
+                return None
+            return record
 
-    def consume_result(self, job_id: str) -> dict | None:
+    def consume_result(self, job_id: str, *, user_id: str | None = None) -> dict | None:
+        safe_user_id = self._normalize_user_id(user_id)
         with self._lock:
             record = self._jobs.get(job_id)
             if not record or record.status != "completed" or not record.result:
                 return None
+            if user_id is not None and record.user_id != safe_user_id:
+                return None
             payload = record.result
             record.result_consumed = True
             record.updated_at = _now()
+            self._persist_record_locked(record)
             # URL 素材模式需要在前端拉取一次下载后的视频，因此延迟清理到过期回收阶段。
             if record.source_mode != "url":
                 safe_rmtree(record.work_dir)
             return payload
 
-    def find_active_job(self) -> JobRecord | None:
+    def find_active_job(self, *, user_id: str | None = None) -> JobRecord | None:
+        safe_user_id = self._normalize_user_id(user_id)
         with self._lock:
             self._ensure_worker_alive_locked()
             self._cleanup_expired_locked()
             active_records = [
                 item for item in self._jobs.values()
                 if item.status in ("queued", "running")
+                and (user_id is None or item.user_id == safe_user_id)
             ]
             if not active_records:
                 return None
             return sorted(active_records, key=lambda item: item.created_at, reverse=True)[0]
 
-    def delete_job(self, job_id: str) -> dict[str, Any] | None:
+    def check_submit_capacity(self, *, user_id: str) -> dict[str, Any]:
+        safe_user_id = self._normalize_user_id(user_id)
+        with self._lock:
+            self._ensure_worker_alive_locked()
+            self._cleanup_expired_locked()
+            active = [item for item in self._jobs.values() if item.status in ("queued", "running")]
+            user_active = [item for item in active if item.user_id == safe_user_id]
+            if len(user_active) >= self._per_user_concurrency_limit:
+                latest = sorted(user_active, key=lambda item: item.created_at, reverse=True)[0]
+                return {
+                    "ok": False,
+                    "code": "user_concurrency_limit",
+                    "message": f"当前用户最多允许 {self._per_user_concurrency_limit} 个进行中任务",
+                    "active_job_id": latest.job_id,
+                    "active_job_status": latest.status,
+                }
+            if len(active) >= self._global_concurrency_limit:
+                return {
+                    "ok": False,
+                    "code": "global_concurrency_limit",
+                    "message": f"全局任务容量已达上限（{self._global_concurrency_limit}）",
+                    "active_count": len(active),
+                }
+            return {
+                "ok": True,
+                "active_count": len(active),
+                "user_active_count": len(user_active),
+            }
+
+    def delete_job(self, job_id: str, *, user_id: str | None = None) -> dict[str, Any] | None:
+        safe_user_id = self._normalize_user_id(user_id)
         with self._lock:
             self._ensure_worker_alive_locked()
             record = self._jobs.get(job_id)
             if not record:
+                return None
+            if user_id is not None and record.user_id != safe_user_id:
                 return None
             if record.status == "running":
                 now = _now()
@@ -657,6 +930,7 @@ class SubtitleJobManager:
                     now=now,
                 )
                 self._bump_status_revision_locked(record)
+                self._persist_record_locked(record)
                 return {"job_id": job_id, "status": "cancel_requested", "cancel_requested": True}
             if record.status == "queued":
                 now = _now()
@@ -683,9 +957,11 @@ class SubtitleJobManager:
                 )
                 self._bump_status_revision_locked(record)
                 self._finalize_stage_tracking_locked(record, now=now)
+                self._persist_record_locked(record)
                 return {"job_id": job_id, "status": "cancelled", "cancel_requested": False}
             safe_rmtree(record.work_dir)
             self._jobs.pop(job_id, None)
+            self._delete_record_locked(job_id=job_id)
             return {"job_id": job_id, "status": "cancelled", "cancel_requested": False}
 
     def serialize_status(self, record: JobRecord) -> dict[str, Any]:
@@ -703,7 +979,7 @@ class SubtitleJobManager:
         current_stage = self._map_stage_for_display(record.current_stage, translation_model_requested=translation_model_requested)
         with self._lock:
             self._ensure_worker_alive_locked()
-            worker_alive = bool(self._worker and self._worker.is_alive())
+            worker_alive = any(worker.is_alive() for worker in self._workers)
             if record.status == "queued":
                 ordered = sorted(self._jobs.values(), key=lambda item: item.created_at)
                 for item in ordered:
@@ -847,6 +1123,7 @@ class SubtitleJobManager:
                 now=now,
             )
             self._bump_status_revision_locked(record)
+            self._persist_record_locked(record)
 
     def _should_cancel_job(self, job_id: str) -> bool:
         with self._lock:
@@ -858,6 +1135,9 @@ class SubtitleJobManager:
     def _worker_loop(self) -> None:
         while True:
             job_id = self._queue.get()
+            should_wait = False
+            job_started = False
+            active_user_id = ""
             with self._lock:
                 record = self._jobs.get(job_id)
                 if not record:
@@ -866,30 +1146,48 @@ class SubtitleJobManager:
                 if record.status == "cancelled" or record.cancel_requested:
                     self._queue.task_done()
                     continue
-                now = _now()
-                record.status = "running"
-                self._transition_stage_locked(record, "running", now=now)
-                record.message = "任务开始执行"
-                record.error = None
-                record.error_code = ""
-                record.error_detail = None
-                record.sync_diagnostics = {}
-                record.partial_result = None
-                record.result = None
-                record.result_consumed = False
-                record.started_at = now
-                record.updated_at = now
-                self._set_stage_detail_locked(record, stage="running", now=now, detail={"step_key": "running", "step_label": "任务开始执行"})
-                self._append_progress_event_locked(
-                    record,
-                    stage="running",
-                    percent=record.progress_percent,
-                    message="任务开始执行",
-                    level="info",
-                    now=now,
-                )
-                self._bump_status_revision_locked(record)
-                Path(record.work_dir).mkdir(parents=True, exist_ok=True)
+                if not self._can_start_job_locked(record):
+                    self._queue.put(job_id)
+                    self._queue.task_done()
+                    should_wait = True
+                else:
+                    self._active_jobs_total += 1
+                    self._active_by_user[record.user_id] = int(self._active_by_user.get(record.user_id, 0)) + 1
+                    active_user_id = record.user_id
+                    job_started = True
+                    now = _now()
+                    record.status = "running"
+                    self._transition_stage_locked(record, "running", now=now)
+                    record.message = "任务开始执行"
+                    record.error = None
+                    record.error_code = ""
+                    record.error_detail = None
+                    record.sync_diagnostics = {}
+                    record.partial_result = None
+                    record.result = None
+                    record.result_consumed = False
+                    record.started_at = now
+                    record.updated_at = now
+                    self._set_stage_detail_locked(
+                        record,
+                        stage="running",
+                        now=now,
+                        detail={"step_key": "running", "step_label": "任务开始执行"},
+                    )
+                    self._append_progress_event_locked(
+                        record,
+                        stage="running",
+                        percent=record.progress_percent,
+                        message="任务开始执行",
+                        level="info",
+                        now=now,
+                    )
+                    self._bump_status_revision_locked(record)
+                    self._persist_record_locked(record)
+                    Path(record.work_dir).mkdir(parents=True, exist_ok=True)
+            if should_wait:
+                time.sleep(0.2)
+                continue
 
             try:
                 if record.job_kind == "llm_resume":
@@ -978,6 +1276,7 @@ class SubtitleJobManager:
                         )
                         self._bump_status_revision_locked(current)
                         self._finalize_stage_tracking_locked(current, now=now)
+                        self._persist_record_locked(current)
                         continue
                     stats = result.get("stats") if isinstance(result, dict) else {}
                     if isinstance(stats, dict):
@@ -1021,6 +1320,7 @@ class SubtitleJobManager:
                     )
                     self._bump_status_revision_locked(current)
                     self._finalize_stage_tracking_locked(current, now=now)
+                    self._persist_record_locked(current)
                     if isinstance(stats, dict):
                         try:
                             append_asr_cost_record(
@@ -1093,6 +1393,7 @@ class SubtitleJobManager:
                         )
                         self._bump_status_revision_locked(current)
                         self._finalize_stage_tracking_locked(current, now=now)
+                        self._persist_record_locked(current)
                     else:
                         if exc.code == "llm_invalid_json":
                             if current.job_kind == "llm_resume":
@@ -1138,6 +1439,7 @@ class SubtitleJobManager:
                                 )
                                 self._bump_status_revision_locked(current)
                                 self._finalize_stage_tracking_locked(current, now=now)
+                                self._persist_record_locked(current)
                                 print(f"[DEBUG] Completed job {job_id} with partial result due to LLM JSON error.")
                                 continue
                         now = _now()
@@ -1180,6 +1482,7 @@ class SubtitleJobManager:
                         )
                         self._bump_status_revision_locked(current)
                         self._finalize_stage_tracking_locked(current, now=now)
+                        self._persist_record_locked(current)
             except Exception as exc:
                 with self._lock:
                     current = self._jobs.get(job_id)
@@ -1215,8 +1518,17 @@ class SubtitleJobManager:
                     )
                     self._bump_status_revision_locked(current)
                     self._finalize_stage_tracking_locked(current, now=now)
+                    self._persist_record_locked(current)
             finally:
                 with self._lock:
+                    if job_started:
+                        self._active_jobs_total = max(0, self._active_jobs_total - 1)
+                        if active_user_id:
+                            next_count = max(0, int(self._active_by_user.get(active_user_id, 0)) - 1)
+                            if next_count <= 0:
+                                self._active_by_user.pop(active_user_id, None)
+                            else:
+                                self._active_by_user[active_user_id] = next_count
                     self._cleanup_expired_locked()
                 self._queue.task_done()
 
@@ -1240,3 +1552,4 @@ class SubtitleJobManager:
                 remove_ids.append(job_id)
         for job_id in remove_ids:
             self._jobs.pop(job_id, None)
+            self._delete_record_locked(job_id=job_id)

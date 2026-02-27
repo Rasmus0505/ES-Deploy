@@ -1806,6 +1806,71 @@ body.listening-immersive-active .page-listening-practice.is-immersive .practice-
   }
 }
 
+.page-wallet {
+  display: grid;
+  gap: 1rem;
+}
+
+.wallet-overview-grid {
+  display: grid;
+  gap: 0.75rem;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+}
+
+.wallet-main-grid {
+  display: grid;
+  gap: 1rem;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+}
+
+.wallet-stat-card {
+  border: 1px solid hsl(0 0% 24%);
+  border-radius: 0.75rem;
+  background: hsl(0 0% 13%);
+  padding: 0.75rem;
+  display: grid;
+  gap: 0.32rem;
+}
+
+.wallet-stat-value {
+  font-size: 1.12rem;
+  font-weight: 700;
+}
+
+.wallet-redeem-body {
+  display: grid;
+  gap: 0.75rem;
+}
+
+.wallet-redeem-actions {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  flex-wrap: wrap;
+}
+
+.wallet-pack-list {
+  display: grid;
+  gap: 0.65rem;
+}
+
+.wallet-pack-item {
+  border: 1px solid hsl(0 0% 24%);
+  border-radius: 0.7rem;
+  padding: 0.65rem 0.7rem;
+  display: grid;
+  gap: 0.3rem;
+  background: hsl(0 0% 13%);
+}
+
+.wallet-pack-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+}
+
 .page-profile {
   display: grid;
   gap: 1rem;
@@ -2068,6 +2133,14 @@ body.listening-immersive-active .page-listening-practice.is-immersive .practice-
 }
 
 @media (max-width: 1024px) {
+  .wallet-overview-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .wallet-main-grid {
+    grid-template-columns: 1fr;
+  }
+
   .reading-v2__layout {
     grid-template-columns: 1fr;
   }

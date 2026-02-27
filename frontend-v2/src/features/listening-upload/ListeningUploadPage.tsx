@@ -409,7 +409,7 @@ export function ListeningUploadPage() {
   const [upgradeOptions, setUpgradeOptions] = useState<SubtitleOptionForm>(() => loadSubtitleOptionForm());
   const [upgradeSourceUrl, setUpgradeSourceUrl] = useState('');
   const [upgradeSourceFile, setUpgradeSourceFile] = useState<File | null>(null);
-  const { profile, loading: profileLoading, error: profileError } = useProfileSettings();
+  const { profile, error: profileError } = useProfileSettings();
   const { copyToClipboard, isCopied } = useCopyToClipboard();
 
   const pollTimerRef = useRef<number | null>(null);
@@ -429,7 +429,7 @@ export function ListeningUploadPage() {
     [options, profileListeningLlm]
   );
   const actionBusy = busy || pendingAction !== null;
-  const canSubmit = !actionBusy && !profileLoading && (sourceMode === 'url' ? sourceUrl.trim().length > 0 : Boolean(videoFile));
+  const canSubmit = !actionBusy && (sourceMode === 'url' ? sourceUrl.trim().length > 0 : Boolean(videoFile));
   const canCancel = !actionBusy && Boolean(status?.job_id) && ['queued', 'running'].includes(String(status?.status || ''));
   const pendingDeleteHistoryName = String(pendingDeleteHistory?.displayName || pendingDeleteHistory?.videoName || '该历史').trim() || '该历史';
   const canAutoProbeWhisper = useMemo(() => {
@@ -1044,7 +1044,6 @@ export function ListeningUploadPage() {
   };
 
   const runWhisperProbe = useCallback(async (trigger: 'manual' | 'auto') => {
-    if (profileLoading) return;
     const probeId = whisperProbeSequenceRef.current + 1;
     whisperProbeSequenceRef.current = probeId;
     if (whisperProbeControllerRef.current) {
@@ -1088,7 +1087,7 @@ export function ListeningUploadPage() {
         setPendingAction(null);
       }
     }
-  }, [profileLoading, subtitleOptions]);
+  }, [subtitleOptions]);
 
   const handleWhisperTest = async () => {
     if (busy || pendingAction) return;
@@ -1101,7 +1100,7 @@ export function ListeningUploadPage() {
   };
 
   useEffect(() => {
-    if (profileLoading || !canAutoProbeWhisper) {
+    if (!canAutoProbeWhisper) {
       if (whisperProbeControllerRef.current) {
         whisperProbeControllerRef.current.abort();
         whisperProbeControllerRef.current = null;
@@ -1121,16 +1120,11 @@ export function ListeningUploadPage() {
     options.whisperBaseUrl,
     options.whisperModel,
     options.whisperRuntime,
-    profileLoading,
     runWhisperProbe
   ]);
 
   const handleSubmit = async () => {
     if (!canSubmit || pendingAction) return;
-    if (profileLoading) {
-      toast.warning('个人中心配置加载中，请稍后再试');
-      return;
-    }
     const validationError = getSubmitValidationError(sourceMode, videoFile, sourceUrl, options);
     if (validationError) {
       setErrorText(validationError);
@@ -1480,10 +1474,6 @@ export function ListeningUploadPage() {
 
   const handleSubmitUpgrade = async () => {
     if (!upgradeRecord) return;
-    if (profileLoading) {
-      toast.warning('个人中心配置加载中，请稍后再试');
-      return;
-    }
     setBusy(true);
     setErrorText('');
     setStatus(null);
@@ -1994,10 +1984,10 @@ export function ListeningUploadPage() {
               </InputGroup>
             </div>
             <div className="upload-whisper-probe-row">
-              <Button
+                <Button
                 type="button"
                 variant="secondary"
-                disabled={actionBusy || profileLoading || !canAutoProbeWhisper}
+                disabled={actionBusy || !canAutoProbeWhisper}
                 icon={isWhisperTesting ? <Spinner size="sm" /> : <FlaskConical size={16} strokeWidth={1.8} />}
                 onClick={() => void handleWhisperTest()}
               >
@@ -2015,10 +2005,10 @@ export function ListeningUploadPage() {
           </CardBody>
         </Card>
         <div className="upload-profile-link-row">
-          <TypographyMuted>LLM 配置来自个人中心，本页不再提供 LLM 参数编辑。</TypographyMuted>
-          {profileError ? <TypographySmall className="error-text">个人中心读取失败，已回退默认 LLM。</TypographySmall> : null}
+          <TypographyMuted>LLM 通道由系统统一托管，本页不再需要填写 API Key。</TypographyMuted>
+          {profileError ? <TypographySmall className="error-text">个人中心读取失败，不影响听力生成和提交。</TypographySmall> : null}
           <Button type="button" variant="outline" size="sm" onClick={() => navigate('/profile')}>
-            前往个人中心
+            打开个人中心
           </Button>
         </div>
       </div>
@@ -2049,7 +2039,6 @@ export function ListeningUploadPage() {
               {isCancellingJob ? '取消中...' : '取消'}
             </Button>
           </div>
-          {profileLoading ? <TypographyMuted>个人中心配置加载中，暂不可提交或检测。</TypographyMuted> : null}
           {errorText ? <TypographyP className="error-text">{errorText}</TypographyP> : null}
         </CardBody>
       </Card>
