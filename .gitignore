@@ -15,3 +15,4 @@ test-results/
 backend/.env*
 frontend-v2/.env*
 !frontend-v2/.env.example
+frontend-v2/tsconfig.tsbuildinfo
