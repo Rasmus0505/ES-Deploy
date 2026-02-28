@@ -62,6 +62,13 @@ npm run dev -- --host 127.0.0.1 --port 8510 --strictPort
 - `SUBTITLE_PER_USER_CONCURRENCY`：单用户并发上限（默认 `1`）
 - `URL_SOURCE_ALLOWED_DOMAINS`：URL 任务允许域名（默认 `youtube.com,youtu.be,bilibili.com,b23.tv`）
 - `YT_DLP_EXECUTABLE`：`yt-dlp` 可执行路径（Zeabur 建议显式配置）
+- `PIP_CACHE_DIR`：建议设置为持久卷路径（如 `/data/pip-cache`），减少重复部署下载依赖时间
+- `PIP_DISABLE_PIP_VERSION_CHECK=1`：关闭 pip 版本检查，缩短安装准备阶段
+
+部署提速说明：
+
+- 后端主依赖已精简到核心运行链路，移除了 `spacy/pandas/openpyxl/keybert/sentence-transformers/dashscope` 等重量包。
+- 若后续需要启用对应可选能力，可在服务内额外安装这些包；未安装时不影响主流程，只会让健康检查中的可选能力标记为 `false`。
 
 部署后运行依赖验收（`GET /api/v1/health`）：
 
