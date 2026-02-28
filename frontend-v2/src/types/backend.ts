@@ -84,6 +84,12 @@ export interface JobStatusResponse {
   message: string;
   error: string | null;
   error_code?: string;
+  error_detail?: {
+    stage?: string;
+    code?: string;
+    message?: string;
+    detail?: string;
+  } | null;
   partial_result?: SubtitleJobResult | null;
   started_at: string | null;
   updated_at: string | null;

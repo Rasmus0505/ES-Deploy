@@ -1069,6 +1069,7 @@ class SubtitleJobManager:
             "message": self._map_message_for_display(message, translation_model_requested=translation_model_requested),
             "error": record.error,
             "error_code": str(record.error_code or "").strip(),
+            "error_detail": dict(record.error_detail) if isinstance(record.error_detail, dict) else None,
             "started_at": _iso(record.started_at),
             "updated_at": _iso(record.updated_at),
             "cancel_requested": bool(record.cancel_requested),

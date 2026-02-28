@@ -219,6 +219,45 @@ const getSubmitValidationError = (sourceMode: SourceMode, videoFile: File | null
   return '';
 };
 
+const normalizeInlineDetail = (value: string, maxLength = 220) => {
+  const compact = String(value || '').replace(/\s+/g, ' ').trim();
+  if (!compact) return '';
+  if (compact.length <= maxLength) return compact;
+  return `${compact.slice(0, maxLength)}...`;
+};
+
+const buildJobFailureMessage = (payload: JobStatusResponse) => {
+  const errorCode = String(payload.error_code || '').trim();
+  const baseMessage = String(payload.error || payload.message || '任务失败').trim() || '任务失败';
+  const detailPayload = payload.error_detail && typeof payload.error_detail === 'object'
+    ? payload.error_detail
+    : null;
+  const detailRaw = detailPayload && typeof detailPayload.detail === 'string'
+    ? detailPayload.detail
+    : '';
+  const detailText = normalizeInlineDetail(detailRaw, 240);
+
+  const downloadRelatedCodes = new Set([
+    'download_failed',
+    'yt_dlp_command_failed',
+    'download_output_missing',
+    'yt_dlp_not_available',
+    'download_timeout'
+  ]);
+
+  if (downloadRelatedCodes.has(errorCode)) {
+    if (!detailText) {
+      return `[${errorCode}] ${baseMessage}（常见原因：链接受限/需要登录、目标站点拦截、或服务端 yt-dlp 环境异常）`;
+    }
+    return `[${errorCode}] ${baseMessage}（${detailText}）`;
+  }
+
+  if (detailText) {
+    return errorCode ? `[${errorCode}] ${baseMessage}（${detailText}）` : `${baseMessage}（${detailText}）`;
+  }
+  return errorCode ? `[${errorCode}] ${baseMessage}` : baseMessage;
+};
+
 const CONTINUABLE_PENDING_STATES = new Set(['failed', 'cancelled']);
 const VALID_JOB_STATUSES = new Set(['queued', 'running', 'completed', 'failed', 'cancelled']);
 
@@ -665,9 +704,7 @@ export function ListeningUploadPage() {
           setSelectedPendingHistoryKey(selectedKey);
         }
         void syncHistoryRecordsSafely(updated, '任务状态已更新，但历史同步后端失败');
-        const errorCode = String(payload.error_code || '').trim();
-        const baseMessage = String(payload.error || payload.message || '任务失败').trim() || '任务失败';
-        setErrorText(errorCode ? `[${errorCode}] ${baseMessage}` : baseMessage);
+        setErrorText(buildJobFailureMessage(payload));
         return;
       }
       clearPollTimer();

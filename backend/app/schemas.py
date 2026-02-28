@@ -105,6 +105,7 @@ class JobStatusResponse(BaseModel):
     message: str = ""
     error: Optional[str] = None
     error_code: str = ""
+    error_detail: Optional[dict] = None
     partial_result: Optional[dict] = None
     started_at: Optional[str] = None
     updated_at: Optional[str] = None
