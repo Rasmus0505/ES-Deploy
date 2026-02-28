@@ -75,9 +75,7 @@ function AppShellContent() {
   if (isLoginRoute) {
     return (
       <>
-        <section className="app-main__content">
-          <AppRoutes />
-        </section>
+        <AppRoutes />
         <Toaster position="top-center" richColors closeButton />
       </>
     );

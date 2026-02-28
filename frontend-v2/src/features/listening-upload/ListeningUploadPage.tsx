@@ -2,12 +2,8 @@ import {
   Check,
   ClipboardPaste,
   Copy,
-  Eye,
-  EyeOff,
   Eraser,
   FlaskConical,
-  Plus,
-  Trash2,
   Upload,
   XCircle
 } from 'lucide-react';
@@ -59,24 +55,16 @@ import {
 import { ApiRequestError } from '../../lib/api/http';
 import {
   CLOUD_WHISPER_MODEL_OPTIONS,
-  DEFAULT_WHISPER_BASE_URL,
-  getWhisperBaseUrlKey,
-  isValidWhisperBaseUrl,
   LANGUAGE_OPTIONS,
   LOCAL_WHISPER_MODEL_OPTIONS,
-  normalizeWhisperBaseUrl,
-  type ProviderOption,
-  WHISPER_BASE_URL_OPTIONS
+  type ProviderOption
 } from '../../lib/api/provider-presets';
 import {
-  getCustomWhisperBaseUrls,
   getLegacyFileAsFile,
   getLegacyPracticeProgress,
   getListeningIndependentThreshold,
   getListeningRevealGapThreshold,
   getLearningHistory,
-  getWhisperMemoryApiKey,
-  getWhisperMemoryByUrl,
   legacyStorageKeys,
   loadSubtitleOptionForm,
   mapFormToSubtitleJobOptions,
@@ -86,11 +74,8 @@ import {
   readStorageString,
   removeLearningHistoryRecordAndCache,
   renameLearningHistoryRecord,
-  setCustomWhisperBaseUrls,
   setListeningIndependentThreshold,
   setListeningRevealGapThreshold,
-  setWhisperMemoryApiKey,
-  setWhisperMemoryLastModel,
   secondsToDurationLabel,
   type SubtitleOptionForm,
   writeStorage
@@ -133,8 +118,6 @@ const withCurrentValueOption = (
 const TERMINAL_JOB_STATUSES = new Set(['completed', 'failed', 'cancelled']);
 
 type TaskActionKey = 'whisper_test' | 'submit' | 'cancel' | null;
-type WhisperOptionScope = 'main' | 'upgrade';
-type WhisperOptionChangeMeta = { silentWhisperRestore?: boolean };
 
 type ProbeState = {
   status: 'idle' | 'testing' | 'ok' | 'failed';
@@ -384,9 +367,6 @@ export function ListeningUploadPage() {
   const [videoFile, setVideoFile] = useState<File | null>(null);
   const [sourceUrl, setSourceUrl] = useState('');
   const [options, setOptions] = useState<SubtitleOptionForm>(() => loadSubtitleOptionForm());
-  const [customWhisperBaseUrls, setCustomWhisperBaseUrlsState] = useState<string[]>(() => getCustomWhisperBaseUrls());
-  const [newWhisperBaseUrlInput, setNewWhisperBaseUrlInput] = useState('');
-  const [whisperBaseUrlManageError, setWhisperBaseUrlManageError] = useState('');
   const [independentThreshold, setIndependentThreshold] = useState<number>(() => getListeningIndependentThreshold());
   const [revealGapThreshold, setRevealGapThreshold] = useState<number>(() => getListeningRevealGapThreshold());
   const [status, setStatus] = useState<JobStatusResponse | null>(null);
@@ -403,7 +383,6 @@ export function ListeningUploadPage() {
   const [startingCurrentTaskLearning, setStartingCurrentTaskLearning] = useState(false);
   const [busy, setBusy] = useState(false);
   const [pendingAction, setPendingAction] = useState<TaskActionKey>(null);
-  const [showWhisperApiKey, setShowWhisperApiKey] = useState(false);
   const [upgradeDrawerOpen, setUpgradeDrawerOpen] = useState(false);
   const [upgradeRecord, setUpgradeRecord] = useState<HistoryRecord | null>(null);
   const [upgradeOptions, setUpgradeOptions] = useState<SubtitleOptionForm>(() => loadSubtitleOptionForm());
@@ -435,13 +414,11 @@ export function ListeningUploadPage() {
   const canAutoProbeWhisper = useMemo(() => {
     const runtime = String(options.whisperRuntime || '').trim().toLowerCase();
     const model = String(options.whisperModel || '').trim();
-    const baseUrl = String(options.whisperBaseUrl || '').trim();
-    const apiKey = String(options.whisperApiKey || '').trim();
     if (runtime === 'local') {
       return Boolean(model);
     }
-    return Boolean(model && baseUrl && apiKey);
-  }, [options.whisperApiKey, options.whisperBaseUrl, options.whisperModel, options.whisperRuntime]);
+    return Boolean(model);
+  }, [options.whisperModel, options.whisperRuntime]);
   const upgradeSourceState = useMemo<HistoryUpgradeSourceState>(() => {
     if (!upgradeRecord) return 'missing';
     if (upgradeSourceFile || upgradeSourceUrl.trim()) return 'ready';
@@ -462,39 +439,6 @@ export function ListeningUploadPage() {
     () => withCurrentValueOption(options.whisperLanguage, LANGUAGE_OPTIONS),
     [options.whisperLanguage]
   );
-  const builtInWhisperBaseUrlKeys = useMemo(
-    () => new Set(WHISPER_BASE_URL_OPTIONS.map((item) => getWhisperBaseUrlKey(item.value))),
-    []
-  );
-  const whisperBaseUrlOptions = useMemo(
-    () => {
-      const seen = new Set<string>();
-      const customOptions: DropdownOption[] = [];
-      customWhisperBaseUrls.forEach((item) => {
-        const normalized = normalizeWhisperBaseUrl(item);
-        if (!isValidWhisperBaseUrl(normalized)) return;
-        const key = getWhisperBaseUrlKey(normalized);
-        if (!key || builtInWhisperBaseUrlKeys.has(key) || seen.has(key)) return;
-        seen.add(key);
-        customOptions.push({
-          value: normalized,
-          label: `自定义 · ${normalized}`
-        });
-      });
-      return withCurrentValueOption(options.whisperBaseUrl, [...WHISPER_BASE_URL_OPTIONS, ...customOptions]);
-    },
-    [builtInWhisperBaseUrlKeys, customWhisperBaseUrls, options.whisperBaseUrl]
-  );
-  const canRemoveCurrentCustomWhisperBaseUrl = useMemo(() => {
-    const currentKey = getWhisperBaseUrlKey(options.whisperBaseUrl);
-    if (!currentKey || builtInWhisperBaseUrlKeys.has(currentKey)) return false;
-    return customWhisperBaseUrls.some((item) => getWhisperBaseUrlKey(item) === currentKey);
-  }, [builtInWhisperBaseUrlKeys, customWhisperBaseUrls, options.whisperBaseUrl]);
-  const canRemoveCurrentCustomUpgradeWhisperBaseUrl = useMemo(() => {
-    const currentKey = getWhisperBaseUrlKey(upgradeOptions.whisperBaseUrl);
-    if (!currentKey || builtInWhisperBaseUrlKeys.has(currentKey)) return false;
-    return customWhisperBaseUrls.some((item) => getWhisperBaseUrlKey(item) === currentKey);
-  }, [builtInWhisperBaseUrlKeys, customWhisperBaseUrls, upgradeOptions.whisperBaseUrl]);
   const isTerminalStatus = useMemo(
     () => TERMINAL_JOB_STATUSES.has(String(status?.status || '').trim()),
     [status?.status]
@@ -852,164 +796,20 @@ export function ListeningUploadPage() {
     })();
   }, [options.whisperRuntime]);
 
-  const buildWhisperAwareNextOptions = useCallback(
-    <K extends keyof SubtitleOptionForm>(prev: SubtitleOptionForm, key: K, value: SubtitleOptionForm[K]) => {
+  const updateOption = <K extends keyof SubtitleOptionForm>(key: K, value: SubtitleOptionForm[K]) => {
+    setOptions((prev) => {
       const next = { ...prev, [key]: value } as SubtitleOptionForm;
-      let restoredByUrl = false;
-      let restoredByModel = false;
-      const runtime = String(next.whisperRuntime || '').trim().toLowerCase();
-      if (runtime !== 'cloud') {
-        return { next, restoredByUrl, restoredByModel };
-      }
-
-      if (key === 'whisperBaseUrl') {
-        const bucket = getWhisperMemoryByUrl(runtime, next.whisperBaseUrl);
-        if (!bucket) return { next, restoredByUrl, restoredByModel };
-
-        const rememberedModel = String(bucket.lastModel || '').trim();
-        if (rememberedModel) {
-          next.whisperModel = rememberedModel;
-        }
-        const rememberedApiKey = String(
-          getWhisperMemoryApiKey(runtime, next.whisperBaseUrl, next.whisperModel) || bucket.lastApiKey || ''
-        ).trim();
-        if (rememberedApiKey) {
-          next.whisperApiKey = rememberedApiKey;
-        }
-        restoredByUrl = Boolean(rememberedModel || rememberedApiKey);
-        return { next, restoredByUrl, restoredByModel };
-      }
-
-      if (key === 'whisperModel') {
-        const model = String(next.whisperModel || '').trim();
-        setWhisperMemoryLastModel(runtime, next.whisperBaseUrl, model);
-        const rememberedApiKey = String(
-          getWhisperMemoryApiKey(runtime, next.whisperBaseUrl, model) || ''
-        ).trim();
-        if (rememberedApiKey) {
-          next.whisperApiKey = rememberedApiKey;
-        }
-        restoredByModel = Boolean(rememberedApiKey);
-        return { next, restoredByUrl, restoredByModel };
-      }
-
-      if (key === 'whisperApiKey') {
-        setWhisperMemoryApiKey(runtime, next.whisperBaseUrl, next.whisperModel, String(next.whisperApiKey || ''));
-      }
-
-      return { next, restoredByUrl, restoredByModel };
-    },
-    []
-  );
-
-  const applyOptionUpdate = useCallback(
-    <K extends keyof SubtitleOptionForm>(
-      scope: WhisperOptionScope,
-      key: K,
-      value: SubtitleOptionForm[K],
-      meta?: WhisperOptionChangeMeta
-    ) => {
-      const current = scope === 'main' ? optionsRef.current : upgradeOptionsRef.current;
-      const { next, restoredByUrl, restoredByModel } = buildWhisperAwareNextOptions(current, key, value);
-      if (scope === 'main') {
-        optionsRef.current = next;
-        setOptions(next);
-        if (key === 'whisperBaseUrl') {
-          setWhisperBaseUrlManageError('');
-        }
-      } else {
-        upgradeOptionsRef.current = next;
-        setUpgradeOptions(next);
-        if (key === 'whisperBaseUrl') {
-          setWhisperBaseUrlManageError('');
-        }
-      }
-
-      if (meta?.silentWhisperRestore) return;
-      if (restoredByUrl) {
-        toast.success('已恢复该 URL 的历史模型与 API Key', { duration: 1800 });
-      } else if (restoredByModel) {
-        toast.success('已恢复该模型历史 API Key', { duration: 1800 });
-      }
-    },
-    [buildWhisperAwareNextOptions]
-  );
-
-  const updateOption = <K extends keyof SubtitleOptionForm>(
-    key: K,
-    value: SubtitleOptionForm[K],
-    meta?: WhisperOptionChangeMeta
-  ) => {
-    applyOptionUpdate('main', key, value, meta);
+      optionsRef.current = next;
+      return next;
+    });
   };
 
-  const updateUpgradeOption = <K extends keyof SubtitleOptionForm>(
-    key: K,
-    value: SubtitleOptionForm[K],
-    meta?: WhisperOptionChangeMeta
-  ) => {
-    applyOptionUpdate('upgrade', key, value, meta);
-  };
-
-  const handleAddCustomWhisperBaseUrl = (scope: WhisperOptionScope = 'main') => {
-    const applyWhisperBaseUrlSelection = (value: string) => {
-      if (scope === 'upgrade') {
-        updateUpgradeOption('whisperBaseUrl', value);
-        updateOption('whisperBaseUrl', value, { silentWhisperRestore: true });
-        return;
-      }
-      updateOption('whisperBaseUrl', value);
-      updateUpgradeOption('whisperBaseUrl', value, { silentWhisperRestore: true });
-    };
-    const normalized = normalizeWhisperBaseUrl(newWhisperBaseUrlInput);
-    if (!normalized) {
-      setWhisperBaseUrlManageError('请先输入要添加的 URL。');
-      return;
-    }
-    if (!isValidWhisperBaseUrl(normalized)) {
-      setWhisperBaseUrlManageError('URL 格式无效，请输入 http:// 或 https:// 开头的地址。');
-      return;
-    }
-
-    const nextKey = getWhisperBaseUrlKey(normalized);
-    if (builtInWhisperBaseUrlKeys.has(nextKey)) {
-      applyWhisperBaseUrlSelection(normalized);
-      setNewWhisperBaseUrlInput('');
-      setWhisperBaseUrlManageError('该 URL 已在内置列表中，已直接切换。');
-      return;
-    }
-
-    const exists = customWhisperBaseUrls.some((item) => getWhisperBaseUrlKey(item) === nextKey);
-    if (exists) {
-      applyWhisperBaseUrlSelection(normalized);
-      setNewWhisperBaseUrlInput('');
-      setWhisperBaseUrlManageError('该自定义 URL 已存在，已直接切换。');
-      return;
-    }
-
-    const nextCustomList = setCustomWhisperBaseUrls([...customWhisperBaseUrls, normalized]);
-    setCustomWhisperBaseUrlsState(nextCustomList);
-    applyWhisperBaseUrlSelection(normalized);
-    setNewWhisperBaseUrlInput('');
-    setWhisperBaseUrlManageError('');
-  };
-
-  const handleRemoveCurrentCustomWhisperBaseUrl = (currentValue?: string, scope: WhisperOptionScope = 'main') => {
-    const selectedValue = normalizeWhisperBaseUrl(currentValue ?? options.whisperBaseUrl);
-    const currentKey = getWhisperBaseUrlKey(selectedValue);
-    if (!currentKey || builtInWhisperBaseUrlKeys.has(currentKey)) return;
-    const nextCustomList = setCustomWhisperBaseUrls(
-      customWhisperBaseUrls.filter((item) => getWhisperBaseUrlKey(item) !== currentKey)
-    );
-    setCustomWhisperBaseUrlsState(nextCustomList);
-    if (scope === 'upgrade') {
-      updateUpgradeOption('whisperBaseUrl', DEFAULT_WHISPER_BASE_URL);
-      updateOption('whisperBaseUrl', DEFAULT_WHISPER_BASE_URL, { silentWhisperRestore: true });
-    } else {
-      updateOption('whisperBaseUrl', DEFAULT_WHISPER_BASE_URL);
-      updateUpgradeOption('whisperBaseUrl', DEFAULT_WHISPER_BASE_URL, { silentWhisperRestore: true });
-    }
-    setWhisperBaseUrlManageError('');
+  const updateUpgradeOption = <K extends keyof SubtitleOptionForm>(key: K, value: SubtitleOptionForm[K]) => {
+    setUpgradeOptions((prev) => {
+      const next = { ...prev, [key]: value } as SubtitleOptionForm;
+      upgradeOptionsRef.current = next;
+      return next;
+    });
   };
 
   const handleSourceModeChange = (nextValue: string) => {
@@ -1092,7 +892,7 @@ export function ListeningUploadPage() {
   const handleWhisperTest = async () => {
     if (busy || pendingAction) return;
     if (!canAutoProbeWhisper) {
-      toast.warning('请先填写完整字幕生成配置后再检测');
+      toast.warning('请先选择字幕运行方式与模型后再检测');
       return;
     }
     setErrorText('');
@@ -1116,8 +916,6 @@ export function ListeningUploadPage() {
     };
   }, [
     canAutoProbeWhisper,
-    options.whisperApiKey,
-    options.whisperBaseUrl,
     options.whisperModel,
     options.whisperRuntime,
     runWhisperProbe
@@ -1894,61 +1692,6 @@ export function ListeningUploadPage() {
               </div>
             </div>
 
-            {options.whisperRuntime === 'cloud' ? (
-              <div>
-                <HoverExplain asChild content="云端模式下可选择预设或自定义字幕生成服务地址。">
-                  <Label htmlFor="whisperBaseUrl">字幕生成 URL</Label>
-                </HoverExplain>
-                <div className="inline-stack">
-                  <Select id="whisperBaseUrl" value={options.whisperBaseUrl} onChange={(event) => updateOption('whisperBaseUrl', event.target.value)}>
-                    {whisperBaseUrlOptions.map((item) => (
-                      <option key={item.value} value={item.value}>{item.label}</option>
-                    ))}
-                  </Select>
-                  <InputGroup className="upload-url-input-group">
-                    <InputGroupInput
-                      id="whisperBaseUrlCustomInput"
-                      placeholder="新增自定义 URL（https://...）"
-                      value={newWhisperBaseUrlInput}
-                      onChange={(event) => setNewWhisperBaseUrlInput(event.target.value)}
-                      onKeyDown={(event) => {
-                        if (event.key === 'Enter') {
-                          event.preventDefault();
-                          handleAddCustomWhisperBaseUrl('main');
-                        }
-                      }}
-                    />
-                    <InputGroupAddon align="inline-end">
-                      <InputGroupButton
-                        aria-label="添加字幕生成 URL"
-                        title="添加字幕生成 URL"
-                        size="icon-xs"
-                        onClick={() => handleAddCustomWhisperBaseUrl('main')}
-                      >
-                        <Plus />
-                      </InputGroupButton>
-                      <InputGroupButton
-                        aria-label="删除当前自定义字幕生成 URL"
-                        title="删除当前自定义字幕生成 URL"
-                        size="icon-xs"
-                        disabled={!canRemoveCurrentCustomWhisperBaseUrl}
-                        onClick={() => handleRemoveCurrentCustomWhisperBaseUrl(options.whisperBaseUrl)}
-                      >
-                        <Trash2 />
-                      </InputGroupButton>
-                    </InputGroupAddon>
-                  </InputGroup>
-                  {whisperBaseUrlManageError ? (
-                    <TypographySmall className="error-text">{whisperBaseUrlManageError}</TypographySmall>
-                  ) : (
-                    <TypographySmall asChild>
-                      <span className="upload-file-hint">可新增并保存自定义 URL，仅自定义项支持删除。</span>
-                    </TypographySmall>
-                  )}
-                </div>
-              </div>
-            ) : null}
-
             <div>
               <HoverExplain asChild content="选择语音识别模型，模型越大通常越准。">
                 <Label htmlFor="whisperModel">字幕生成模型</Label>
@@ -1960,29 +1703,11 @@ export function ListeningUploadPage() {
               </Select>
             </div>
 
-            <div>
-              <HoverExplain asChild content="填写字幕生成服务密钥，用于云端识别。">
-                <Label htmlFor="whisperApiKey">字幕生成 API Key</Label>
-              </HoverExplain>
-              <InputGroup>
-                <InputGroupInput
-                  id="whisperApiKey"
-                  type={showWhisperApiKey ? 'text' : 'password'}
-                  value={options.whisperApiKey}
-                  onChange={(event) => updateOption('whisperApiKey', event.target.value)}
-                />
-                <InputGroupAddon align="inline-end">
-                  <InputGroupButton
-                    size="icon-xs"
-                    aria-label={`${showWhisperApiKey ? '隐藏' : '显示'} 字幕生成 API Key`}
-                    title={`${showWhisperApiKey ? '隐藏' : '显示'} 字幕生成 API Key`}
-                    onClick={() => setShowWhisperApiKey((prev) => !prev)}
-                  >
-                    {showWhisperApiKey ? <EyeOff /> : <Eye />}
-                  </InputGroupButton>
-                </InputGroupAddon>
-              </InputGroup>
-            </div>
+            {options.whisperRuntime === 'cloud' ? (
+              <TypographySmall className="upload-file-hint">
+                云端识别会自动使用当前账号的 OneAPI 令牌与托管通道，无需填写 URL 或 API Key。
+              </TypographySmall>
+            ) : null}
             <div className="upload-whisper-probe-row">
                 <Button
                 type="button"
@@ -2005,7 +1730,7 @@ export function ListeningUploadPage() {
           </CardBody>
         </Card>
         <div className="upload-profile-link-row">
-          <TypographyMuted>LLM 通道由系统统一托管，本页不再需要填写 API Key。</TypographyMuted>
+          <TypographyMuted>ASR、翻译模型、LLM 均由系统通过 OneAPI 令牌统一托管，本页无需填写 URL 或 API Key。</TypographyMuted>
           {profileError ? <TypographySmall className="error-text">个人中心读取失败，不影响听力生成和提交。</TypographySmall> : null}
           <Button type="button" variant="outline" size="sm" onClick={() => navigate('/profile')}>
             打开个人中心
@@ -2206,13 +1931,6 @@ export function ListeningUploadPage() {
         sourceFileName={upgradeSourceFile?.name || ''}
         onSourceUrlChange={setUpgradeSourceUrl}
         onSourceFileChange={setUpgradeSourceFile}
-        whisperBaseUrlOptions={whisperBaseUrlOptions}
-        newWhisperBaseUrlInput={newWhisperBaseUrlInput}
-        onNewWhisperBaseUrlInputChange={setNewWhisperBaseUrlInput}
-        onAddCustomWhisperBaseUrl={() => handleAddCustomWhisperBaseUrl('upgrade')}
-        onRemoveCurrentCustomWhisperBaseUrl={() => handleRemoveCurrentCustomWhisperBaseUrl(upgradeOptions.whisperBaseUrl, 'upgrade')}
-        canRemoveCurrentCustomWhisperBaseUrl={canRemoveCurrentCustomUpgradeWhisperBaseUrl}
-        whisperBaseUrlManageError={whisperBaseUrlManageError}
         options={upgradeOptions}
         onOptionChange={updateUpgradeOption}
       />

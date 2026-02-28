@@ -890,6 +890,11 @@ export function mapFormToSubtitleJobOptions(
   llmOverride?: Partial<SubtitleJobOptions['llm']> | null
 ): SubtitleJobOptionsPayload {
   const profile = normalizeAsrProfile(form.asrProfile);
+  const whisperRuntime = form.whisperRuntime === 'local' ? 'local' : 'cloud';
+  const whisperBaseUrl = whisperRuntime === 'cloud'
+    ? ''
+    : (form.whisperBaseUrl.trim() || DEFAULT_WHISPER_BASE_URL);
+  const whisperApiKey = whisperRuntime === 'cloud' ? '' : form.whisperApiKey.trim();
   const llmPayload = {
     base_url: String(llmOverride?.base_url || '').trim() || DEFAULT_LLM_BASE_URL,
     api_key: String(llmOverride?.api_key || '').trim(),
@@ -900,11 +905,11 @@ export function mapFormToSubtitleJobOptions(
     asr_profile: profile,
     llm: llmPayload,
     whisper: {
-      runtime: form.whisperRuntime,
+      runtime: whisperRuntime,
       model: form.whisperModel.trim() || DEFAULT_WHISPER_MODEL,
       language: form.whisperLanguage.trim() || DEFAULT_WHISPER_LANGUAGE,
-      base_url: form.whisperBaseUrl.trim() || DEFAULT_WHISPER_BASE_URL,
-      api_key: form.whisperApiKey.trim()
+      base_url: whisperBaseUrl,
+      api_key: whisperApiKey
     }
   };
 }

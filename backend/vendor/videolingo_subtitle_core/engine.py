@@ -137,51 +137,6 @@ _CLOUD_QWEN_ASR_MODEL = "qwen3-asr-flash-filetrans"
 _CLOUD_ASR_PROVIDER = "cloud_paraformer_v2"
 _CLOUD_QWEN_ASR_PROVIDER = "cloud_qwen3_asr_flash_filetrans"
 _QWEN_FALLBACK_RATIO_THRESHOLD = 0.10
-_QWEN_ASR_SKIP_LANGUAGE_TOKENS = {
-    "",
-    "auto",
-    "mixed",
-    "mix",
-    "multi",
-    "multilingual",
-    "unknown",
-}
-_QWEN_ASR_LANGUAGE_CODES = {
-    "zh",
-    "yue",
-    "en",
-    "ja",
-    "de",
-    "ko",
-    "ru",
-    "fr",
-    "pt",
-    "ar",
-    "it",
-    "es",
-    "hi",
-    "id",
-    "th",
-    "tr",
-    "uk",
-    "vi",
-    "cs",
-    "da",
-    "fil",
-    "fi",
-    "is",
-    "ms",
-    "no",
-    "pl",
-    "sv",
-}
-_QWEN_ASR_UNKNOWN_PARAMETER_HINTS = (
-    "unknown parameter",
-    "unrecognized",
-    "unsupported",
-    "not support",
-    "invalid parameter",
-)
 _CLOUD_ASR_MODEL_ALIASES: dict[str, str] = {
     _CLOUD_ASR_MODEL: _CLOUD_ASR_MODEL,
     _CLOUD_QWEN_ASR_MODEL: _CLOUD_QWEN_ASR_MODEL,
@@ -1255,64 +1210,6 @@ def _transcribe(
     raise PipelineError("asr", "invalid_runtime", f"不支持的 whisper.runtime: {runtime}")
 
 
-def _status_code_to_int(value: Any) -> int:
-    try:
-        return int(value)
-    except Exception:
-        return 0
-
-
-def _normalize_qwen_asr_language(value: Any) -> str | None:
-    normalized = str(value or "").strip().lower()
-    if not normalized or normalized in _QWEN_ASR_SKIP_LANGUAGE_TOKENS:
-        return None
-    if normalized in _QWEN_ASR_LANGUAGE_CODES:
-        return normalized
-    return None
-
-
-def _is_qwen_unknown_parameter_error(*parts: Any) -> bool:
-    text = " ".join(str(part or "") for part in parts).lower()
-    if not text:
-        return False
-    return any(token in text for token in _QWEN_ASR_UNKNOWN_PARAMETER_HINTS)
-
-
-def _build_qwen_request_log_params(kwargs: dict[str, Any]) -> dict[str, Any]:
-    safe_kwargs: dict[str, Any] = {}
-    for key, value in kwargs.items():
-        if key == "file_url":
-            safe_kwargs[key] = "<signed_url>"
-        elif key == "corpus":
-            safe_kwargs[key] = "<provided>" if value else {}
-        else:
-            safe_kwargs[key] = value
-    return safe_kwargs
-
-
-def _dashscope_output_as_dict(response: Any) -> dict:
-    output: Any = None
-    if isinstance(response, dict):
-        output = response.get("output")
-    else:
-        getter = getattr(response, "get", None)
-        if callable(getter):
-            try:
-                output = getter("output")
-            except Exception:
-                output = None
-        if output is None:
-            output = getattr(response, "output", None)
-    if isinstance(output, dict):
-        return output
-    if hasattr(output, "keys"):
-        try:
-            return dict(output)
-        except Exception:
-            return {}
-    return {}
-
-
 def _ms_to_seconds(value: Any) -> float | None:
     milliseconds = _to_finite_float(value)
     if milliseconds is None:
@@ -1487,513 +1384,436 @@ def _flatten_word_segments(segments: Iterable[dict], source: str) -> list[dict]:
     return flattened
 
 
-def _transcribe_paraformer_v2(audio_path: str, whisper: WhisperOptions) -> list[dict]:
+_ASR_RETRY_HINT_TOKENS = (
+    "unsupported",
+    "not support",
+    "not_supported",
+    "unknown parameter",
+    "unrecognized",
+    "invalid parameter",
+    "extra fields",
+    "unknown url",
+    "unknown endpoint",
+    "no route",
+    "route not found",
+    "not found",
+    "method not allowed",
+    "invalid endpoint",
+    "cannot post",
+)
+_ASR_NO_RETRY_HINT_TOKENS = (
+    "invalid api key",
+    "incorrect api key",
+    "authentication",
+    "unauthorized",
+    "forbidden",
+    "insufficient_quota",
+    "insufficient quota",
+    "billing",
+)
+_ASR_ENDPOINT_SUFFIXES = (
+    "/audio/transcriptions",
+    "/files/transcriptions",
+)
+_TRANSCRIPTION_START_TIME_KEYS: tuple[tuple[str, bool], ...] = (
+    ("start", False),
+    ("start_time", False),
+    ("startTime", False),
+    ("from", False),
+    ("offset", False),
+    ("begin", False),
+    ("start_ms", True),
+    ("startTimeMs", True),
+    ("begin_time", True),
+    ("beginTime", True),
+)
+_TRANSCRIPTION_END_TIME_KEYS: tuple[tuple[str, bool], ...] = (
+    ("end", False),
+    ("end_time", False),
+    ("endTime", False),
+    ("to", False),
+    ("finish", False),
+    ("stop", False),
+    ("end_ms", True),
+    ("endTimeMs", True),
+    ("stop_time", True),
+)
+
+
+def _build_asr_endpoint_candidates(base_url: str) -> list[str]:
+    normalized = _normalize_base_url(base_url)
+    normalized_lower = normalized.lower()
+    base_root = normalized
+    for suffix in _ASR_ENDPOINT_SUFFIXES:
+        if normalized_lower.endswith(suffix):
+            base_root = normalized[: -len(suffix)].rstrip("/") or normalized
+            break
+
+    seen: set[str] = set()
+    candidates: list[str] = []
+    for suffix in _ASR_ENDPOINT_SUFFIXES:
+        endpoint = f"{base_root.rstrip('/')}{suffix}"
+        key = endpoint.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        candidates.append(endpoint)
+    if not candidates:
+        candidates.append(normalized.rstrip("/"))
+    return candidates
+
+
+def _build_asr_request_field_candidates(*, model: str, language: str) -> list[list[tuple[str, str]]]:
+    shared_fields: list[tuple[str, str]] = [("model", str(model or "").strip())]
+    safe_language = str(language or "").strip()
+    if safe_language:
+        shared_fields.append(("language", safe_language))
+    raw_candidates: list[list[tuple[str, str]]] = [
+        [
+            *shared_fields,
+            ("response_format", "verbose_json"),
+            ("timestamp_granularities[]", "word"),
+            ("timestamp_granularities[]", "segment"),
+        ],
+        [
+            *shared_fields,
+            ("response_format", "verbose_json"),
+            ("timestamp_granularities", "word"),
+            ("timestamp_granularities", "segment"),
+        ],
+        [*shared_fields, ("response_format", "verbose_json")],
+        [*shared_fields],
+    ]
+    normalized: list[list[tuple[str, str]]] = []
+    seen: set[tuple[tuple[str, str], ...]] = set()
+    for candidate in raw_candidates:
+        key = tuple((str(name or "").strip(), str(value or "").strip()) for name, value in candidate)
+        if key in seen:
+            continue
+        seen.add(key)
+        normalized.append(list(key))
+    return normalized
+
+
+def _extract_asr_error_message(payload: Any, *, fallback_text: str = "") -> str:
+    if isinstance(payload, dict):
+        error_payload = payload.get("error") if isinstance(payload.get("error"), dict) else {}
+        if isinstance(error_payload, dict):
+            message = str(error_payload.get("message") or error_payload.get("error") or "").strip()
+            if message:
+                return message
+        message = str(payload.get("message") or payload.get("detail") or payload.get("error") or "").strip()
+        if message:
+            return message
+        try:
+            return json.dumps(payload, ensure_ascii=False)[:800]
+        except Exception:
+            return str(payload)[:800]
+    if isinstance(payload, list):
+        try:
+            return json.dumps(payload, ensure_ascii=False)[:800]
+        except Exception:
+            return str(payload)[:800]
+    return str(fallback_text or "").strip()
+
+
+def _should_retry_asr_request(status_code: int | None, error_text: str) -> bool:
+    text = str(error_text or "").lower()
+    if any(token in text for token in _ASR_NO_RETRY_HINT_TOKENS):
+        return False
+    if status_code is None:
+        return True
+    if status_code in {401, 403}:
+        return False
+    if status_code >= 500:
+        return True
+    if status_code in {404, 405, 406, 408, 410, 415, 421, 422, 425, 426, 429}:
+        return True
+    if status_code == 400:
+        return any(token in text for token in _ASR_RETRY_HINT_TOKENS)
+    return any(token in text for token in _ASR_RETRY_HINT_TOKENS)
+
+
+def _extract_time_seconds_from_mapping(raw: dict[str, Any], keys: tuple[tuple[str, bool], ...]) -> float | None:
+    for key, as_milliseconds in keys:
+        if key not in raw:
+            continue
+        value = _to_finite_float(raw.get(key))
+        if value is None:
+            continue
+        seconds = value / 1000.0 if as_milliseconds else value
+        return round(max(0.0, seconds), 3)
+    return None
+
+
+def _normalize_transcription_word_items(words: Any) -> list[dict]:
+    if not isinstance(words, list):
+        return []
+    normalized: list[dict] = []
+    for item in words:
+        if isinstance(item, dict):
+            safe = item
+        else:
+            safe = {
+                "word": getattr(item, "word", None),
+                "text": getattr(item, "text", None),
+                "token": getattr(item, "token", None),
+                "start": getattr(item, "start", None),
+                "start_time": getattr(item, "start_time", None),
+                "end": getattr(item, "end", None),
+                "end_time": getattr(item, "end_time", None),
+                "confidence": getattr(item, "confidence", None),
+                "score": getattr(item, "score", None),
+            }
+        word = str(safe.get("word") or safe.get("text") or safe.get("token") or "").strip()
+        start = _extract_time_seconds_from_mapping(safe, _TRANSCRIPTION_START_TIME_KEYS)
+        end = _extract_time_seconds_from_mapping(safe, _TRANSCRIPTION_END_TIME_KEYS)
+        if not word or start is None or end is None or end <= start:
+            continue
+        confidence = _to_finite_float(safe.get("confidence"))
+        if confidence is None:
+            confidence = _to_finite_float(safe.get("score"))
+        if confidence is None:
+            confidence = _to_finite_float(safe.get("probability"))
+        normalized.append(
+            {
+                "word": word,
+                "start": start,
+                "end": end,
+                "confidence": round(confidence, 6) if confidence is not None else None,
+            }
+        )
+    return normalized
+
+
+def _extract_segments_from_openai_transcription_payload(payload: dict) -> list[dict] | None:
+    has_openai_shape = any(key in payload for key in ("text", "segments", "words"))
+    text = str(payload.get("text") or "").strip()
+    global_words = _normalize_transcription_word_items(payload.get("words"))
+    segments_raw = payload.get("segments")
+
+    if isinstance(segments_raw, list):
+        segments: list[dict] = []
+        last_end = 0.0
+        for raw_segment in segments_raw:
+            if not isinstance(raw_segment, dict):
+                continue
+            words = _normalize_transcription_word_items(raw_segment.get("words"))
+            start = _extract_time_seconds_from_mapping(raw_segment, _TRANSCRIPTION_START_TIME_KEYS)
+            end = _extract_time_seconds_from_mapping(raw_segment, _TRANSCRIPTION_END_TIME_KEYS)
+            if not words and global_words and start is not None and end is not None and end > start:
+                words = [
+                    item
+                    for item in global_words
+                    if float(item.get("start") or 0.0) >= start - 0.05 and float(item.get("end") or 0.0) <= end + 0.05
+                ]
+            segment_text = str(raw_segment.get("text") or "").strip()
+            if not segment_text and words:
+                segment_text = " ".join(str(item.get("word") or "").strip() for item in words).strip()
+            if not segment_text:
+                continue
+            if start is None and words:
+                start = float(words[0]["start"])
+            if end is None and words:
+                end = float(words[-1]["end"])
+            if start is None:
+                start = last_end
+            if end is None or end <= start:
+                end = start + 0.8
+            start = round(max(0.0, float(start)), 3)
+            end = round(max(start, float(end)), 3)
+            last_end = end
+            segments.append(
+                {
+                    "start": start,
+                    "end": end,
+                    "text": segment_text,
+                    "words": words,
+                }
+            )
+        if segments:
+            return segments
+
+    if global_words:
+        merged_text = text or " ".join(str(item.get("word") or "").strip() for item in global_words).strip()
+        if merged_text:
+            start = float(global_words[0]["start"])
+            end = float(global_words[-1]["end"])
+            if end <= start:
+                end = start + 0.8
+            return [
+                {
+                    "start": round(max(0.0, start), 3),
+                    "end": round(max(start, end), 3),
+                    "text": merged_text,
+                    "words": global_words,
+                }
+            ]
+
+    if text:
+        return [{"start": 0.0, "end": 0.8, "text": text, "words": []}]
+    if has_openai_shape:
+        return []
+    return None
+
+
+def _extract_segments_from_cloud_transcription_payload(payload: dict) -> list[dict] | None:
+    candidate_payloads: list[dict] = []
+
+    def _append_candidate(value: Any) -> None:
+        if isinstance(value, dict):
+            candidate_payloads.append(value)
+
+    _append_candidate(payload)
+    for key in ("data", "result", "output", "transcription", "response"):
+        value = payload.get(key)
+        if isinstance(value, dict):
+            _append_candidate(value)
+            continue
+        if isinstance(value, list):
+            for item in value:
+                _append_candidate(item)
+
+    for candidate in candidate_payloads:
+        segments = _extract_segments_from_paraformer_payload(candidate)
+        if segments is not None:
+            return segments
+        segments = _extract_segments_from_openai_transcription_payload(candidate)
+        if segments is not None:
+            return segments
+    return None
+
+
+def _transcribe_cloud_openai_compatible(
+    audio_path: str,
+    whisper: WhisperOptions,
+    *,
+    model: str,
+    model_label: str,
+) -> list[dict]:
     api_key = (whisper.api_key or "").strip()
     if not api_key:
         raise PipelineError("asr", "missing_whisper_api_key", "whisper.runtime=cloud 时必须提供 whisper.api_key")
-    requested_model = (whisper.model or "").strip()
-    model = _CLOUD_ASR_MODEL
+
     language = str(whisper.language or "").strip()
+    base_url = _normalize_base_url(whisper.base_url)
+    endpoints = _build_asr_endpoint_candidates(base_url)
+    field_candidates = _build_asr_request_field_candidates(model=model, language=language)
+    failure_details: list[str] = []
+    audio_name = Path(audio_path).name or "audio.wav"
+
     print(
-        f"[DEBUG] Paraformer cloud request model={model} "
-        f"requested_model={requested_model or '-'} language={language or '-'}"
+        f"[DEBUG] {model_label} cloud request model={model} "
+        f"language={language or '-'} base_url={base_url} endpoints={len(endpoints)}"
     )
 
-    try:
-        import dashscope
-        from dashscope.audio.asr import Transcription
-        from dashscope.files import Files
-    except Exception as exc:
-        raise PipelineError(
-            "asr",
-            "cloud_runtime_missing",
-            "云端 ASR 依赖缺失，请安装 dashscope",
-            detail=str(exc)[:500],
-        ) from exc
-
-    dashscope.api_key = api_key
-    try:
-        upload_response = Files.upload(file_path=audio_path, purpose="inference")
-    except Exception as exc:
-        raise PipelineError("asr", "cloud_asr_failed", "Paraformer 文件上传失败", detail=str(exc)[:1000]) from exc
-
-    upload_status_code = _status_code_to_int(getattr(upload_response, "status_code", 0))
-    upload_output = _dashscope_output_as_dict(upload_response)
-    if upload_status_code != 200:
-        raise PipelineError(
-            "asr",
-            "cloud_asr_failed",
-            f"Paraformer 文件上传失败（HTTP {upload_status_code}）",
-            detail=json.dumps(
-                {
-                    "code": str(getattr(upload_response, "code", "") or (upload_response.get("code") if hasattr(upload_response, "get") else "")),
-                    "message": str(getattr(upload_response, "message", "") or (upload_response.get("message") if hasattr(upload_response, "get") else "")),
-                    "output": upload_output,
-                },
-                ensure_ascii=False,
-            )[:1200],
-        )
-
-    uploaded_files = upload_output.get("uploaded_files")
-    file_id = ""
-    if isinstance(uploaded_files, list):
-        for item in uploaded_files:
-            if not isinstance(item, dict):
-                continue
-            file_id = str(item.get("file_id") or "").strip()
-            if file_id:
-                break
-    if not file_id:
-        file_id = str(upload_output.get("file_id") or "").strip()
-    if not file_id:
-        raise PipelineError(
-            "asr",
-            "cloud_asr_failed",
-            "Paraformer 文件上传成功但未返回 file_id",
-            detail=json.dumps(upload_output, ensure_ascii=False)[:1200],
-        )
-
-    print(f"[DEBUG] Paraformer upload succeeded file_id={file_id}")
-    try:
-        file_meta_response = Files.get(file_id=file_id)
-    except Exception as exc:
-        raise PipelineError("asr", "cloud_asr_failed", "Paraformer 文件查询失败", detail=str(exc)[:1000]) from exc
-
-    file_meta_status_code = _status_code_to_int(getattr(file_meta_response, "status_code", 0))
-    file_meta_output = _dashscope_output_as_dict(file_meta_response)
-    if file_meta_status_code != 200:
-        raise PipelineError(
-            "asr",
-            "cloud_asr_failed",
-            f"Paraformer 文件查询失败（HTTP {file_meta_status_code}）",
-            detail=json.dumps(file_meta_output, ensure_ascii=False)[:1200],
-        )
-
-    signed_url = str(file_meta_output.get("url") or "").strip()
-    if not signed_url:
-        files_payload = file_meta_output.get("files")
-        if isinstance(files_payload, list):
-            for item in files_payload:
-                if not isinstance(item, dict):
+    for endpoint in endpoints:
+        for index, fields in enumerate(field_candidates):
+            if index > 0:
+                print(
+                    f"[DEBUG] {model_label} cloud request retry "
+                    f"endpoint={endpoint} payload_variant={index + 1}"
+                )
+            try:
+                with open(audio_path, "rb") as audio_stream:
+                    response = requests.post(
+                        endpoint,
+                        headers={"Authorization": f"Bearer {api_key}"},
+                        data=fields,
+                        files={"file": (audio_name, audio_stream, "audio/wav")},
+                        timeout=180,
+                    )
+            except Exception as exc:
+                error_text = f"request_error={str(exc)[:420]}"
+                failure_details.append(f"endpoint={endpoint}; status=request_error; detail={error_text}")
+                if _should_retry_asr_request(None, error_text):
                     continue
-                candidate_url = str(item.get("url") or "").strip()
-                if candidate_url:
-                    signed_url = candidate_url
-                    break
-    if not signed_url:
-        raise PipelineError(
-            "asr",
-            "cloud_asr_failed",
-            "Paraformer 文件查询成功但未返回签名 URL",
-            detail=json.dumps(file_meta_output, ensure_ascii=False)[:1200],
-        )
+                raise PipelineError(
+                    "asr",
+                    "cloud_asr_failed",
+                    f"{model_label} 云端识别请求失败",
+                    detail="\n".join(failure_details)[:1200],
+                ) from exc
 
-    transcription_kwargs: dict[str, Any] = {
-        "model": model,
-        "file_urls": [signed_url],
-        "timestamp_alignment_enabled": True,
-    }
-    if language:
-        transcription_kwargs["language_hints"] = [language]
+            payload: Any = None
+            try:
+                payload = response.json()
+            except Exception:
+                payload = None
 
-    try:
-        task_response = Transcription.async_call(**transcription_kwargs)
-    except Exception as exc:
-        raise PipelineError("asr", "cloud_asr_failed", "Paraformer 任务创建失败", detail=str(exc)[:1000]) from exc
+            if int(response.status_code) >= 400:
+                error_text = _extract_asr_error_message(payload, fallback_text=str(response.text or "")[:600])
+                failure_detail = (
+                    f"endpoint={endpoint}; status={int(response.status_code)}; detail={error_text[:420]}"
+                )
+                failure_details.append(failure_detail)
+                print(f"[DEBUG] {model_label} cloud request failed {failure_detail}")
+                if _should_retry_asr_request(int(response.status_code), error_text):
+                    continue
+                raise PipelineError(
+                    "asr",
+                    "cloud_asr_failed",
+                    f"{model_label} 云端识别失败（HTTP {int(response.status_code)}）",
+                    detail="\n".join(failure_details)[:1200],
+                )
 
-    task_status_code = _status_code_to_int(getattr(task_response, "status_code", 0))
-    task_output = _dashscope_output_as_dict(task_response)
-    if task_status_code != 200:
-        raise PipelineError(
-            "asr",
-            "cloud_asr_failed",
-            f"Paraformer 任务创建失败（HTTP {task_status_code}）",
-            detail=json.dumps(task_output, ensure_ascii=False)[:1200],
-        )
+            if not isinstance(payload, dict):
+                body_preview = str(response.text or "")[:420]
+                failure_detail = (
+                    f"endpoint={endpoint}; status=200; detail=non_json_body:{body_preview}"
+                )
+                failure_details.append(failure_detail)
+                print(f"[DEBUG] {model_label} cloud request failed {failure_detail}")
+                continue
 
-    task_id = str(task_output.get("task_id") or getattr(getattr(task_response, "output", None), "task_id", "")).strip()
-    if not task_id:
-        raise PipelineError(
-            "asr",
-            "cloud_asr_failed",
-            "Paraformer 任务创建成功但缺少 task_id",
-            detail=json.dumps(task_output, ensure_ascii=False)[:1200],
-        )
+            segments = _extract_segments_from_cloud_transcription_payload(payload)
+            if segments is not None:
+                print(f"[DEBUG] {model_label} cloud request success endpoint={endpoint} segments={len(segments)}")
+                return segments
 
-    print(f"[DEBUG] Paraformer task created task_id={task_id}")
-    try:
-        transcription_response = Transcription.wait(task=task_id)
-    except Exception as exc:
-        raise PipelineError("asr", "cloud_asr_failed", "Paraformer 任务轮询失败", detail=str(exc)[:1000]) from exc
+            payload_keys = list(payload.keys())[:16]
+            failure_detail = (
+                f"endpoint={endpoint}; status=200; detail=unrecognized_payload_keys:{payload_keys}"
+            )
+            failure_details.append(failure_detail)
+            print(f"[DEBUG] {model_label} cloud request failed {failure_detail}")
 
-    wait_status_code = _status_code_to_int(getattr(transcription_response, "status_code", 0))
-    wait_output = _dashscope_output_as_dict(transcription_response)
-    if wait_status_code != 200:
-        raise PipelineError(
-            "asr",
-            "cloud_asr_failed",
-            f"Paraformer 任务轮询失败（HTTP {wait_status_code}）",
-            detail=json.dumps(wait_output, ensure_ascii=False)[:1200],
-        )
+    raise PipelineError(
+        "asr",
+        "cloud_asr_failed",
+        f"{model_label} 云端识别结果缺少可解析分句",
+        detail="\n".join(failure_details)[:1200],
+    )
 
-    results = wait_output.get("results")
-    if not isinstance(results, list) or not results:
-        raise PipelineError(
-            "asr",
-            "cloud_asr_failed",
-            "Paraformer 任务返回空结果",
-            detail=json.dumps(wait_output, ensure_ascii=False)[:1200],
-        )
 
-    successful_result: dict | None = None
-    failed_result: dict | None = None
-    for item in results:
-        if not isinstance(item, dict):
-            continue
-        subtask_status = str(item.get("subtask_status") or "").strip().upper()
-        if subtask_status == "SUCCEEDED":
-            successful_result = item
-            break
-        if failed_result is None:
-            failed_result = item
-
-    if successful_result is None:
-        failed_code = str((failed_result or {}).get("code") or wait_output.get("code") or "").strip()
-        failed_message = str((failed_result or {}).get("message") or wait_output.get("message") or "未知错误").strip()
-        raise PipelineError(
-            "asr",
-            "cloud_asr_failed",
-            "Paraformer 云端识别失败",
-            detail=json.dumps(
-                {
-                    "subtask_code": failed_code,
-                    "subtask_message": failed_message,
-                },
-                ensure_ascii=False,
-            )[:1200],
-        )
-
-    transcription_url = str(successful_result.get("transcription_url") or "").strip()
-    if not transcription_url:
-        raise PipelineError(
-            "asr",
-            "cloud_asr_failed",
-            "Paraformer 识别成功但缺少 transcription_url",
-            detail=json.dumps(successful_result, ensure_ascii=False)[:1200],
-        )
-
-    try:
-        transcription_file_response = requests.get(transcription_url, timeout=120)
-    except Exception as exc:
-        raise PipelineError("asr", "cloud_asr_failed", "Paraformer 结果下载失败", detail=str(exc)[:1000]) from exc
-
-    if transcription_file_response.status_code != 200:
-        raise PipelineError(
-            "asr",
-            "cloud_asr_failed",
-            f"Paraformer 结果下载失败（HTTP {transcription_file_response.status_code}）",
-            detail=transcription_file_response.text[:800],
-        )
-
-    try:
-        payload = transcription_file_response.json()
-    except Exception as exc:
-        raise PipelineError(
-            "asr",
-            "cloud_asr_invalid_json",
-            "云端 ASR 返回非 JSON 响应",
-            detail=transcription_file_response.text[:500],
-        ) from exc
-
-    segments = _extract_segments_from_paraformer_payload(payload)
-    if segments is None:
-        payload_keys = list(payload.keys()) if isinstance(payload, dict) else [type(payload).__name__]
-        raise PipelineError(
-            "asr",
-            "cloud_asr_failed",
-            "Paraformer 云端识别结果缺少可解析分句",
-            detail=json.dumps({"keys": payload_keys}, ensure_ascii=False),
-        )
-    return segments
+def _transcribe_paraformer_v2(audio_path: str, whisper: WhisperOptions) -> list[dict]:
+    requested_model = (whisper.model or "").strip()
+    model = _CLOUD_ASR_MODEL
+    print(
+        f"[DEBUG] Paraformer cloud request model={model} "
+        f"requested_model={requested_model or '-'}"
+    )
+    return _transcribe_cloud_openai_compatible(
+        audio_path,
+        whisper,
+        model=model,
+        model_label="Paraformer",
+    )
 
 
 def _transcribe_qwen3_asr_flash_filetrans(audio_path: str, whisper: WhisperOptions) -> list[dict]:
-    api_key = (whisper.api_key or "").strip()
-    if not api_key:
-        raise PipelineError("asr", "missing_whisper_api_key", "whisper.runtime=cloud 时必须提供 whisper.api_key")
     requested_model = (whisper.model or "").strip()
     model = _CLOUD_QWEN_ASR_MODEL
-    language = str(whisper.language or "").strip()
     print(
         f"[DEBUG] Qwen ASR cloud request model={model} "
-        f"requested_model={requested_model or '-'} language={language or '-'}"
+        f"requested_model={requested_model or '-'}"
     )
-
-    try:
-        import dashscope
-        from dashscope.audio.qwen_asr import QwenTranscription
-        from dashscope.files import Files
-    except Exception as exc:
-        raise PipelineError(
-            "asr",
-            "cloud_runtime_missing",
-            "云端 ASR 依赖缺失，请安装 dashscope",
-            detail=str(exc)[:500],
-        ) from exc
-
-    dashscope.api_key = api_key
-    try:
-        upload_response = Files.upload(file_path=audio_path, purpose="inference")
-    except Exception as exc:
-        raise PipelineError("asr", "cloud_asr_failed", "Qwen ASR 文件上传失败", detail=str(exc)[:1000]) from exc
-
-    upload_status_code = _status_code_to_int(getattr(upload_response, "status_code", 0))
-    upload_output = _dashscope_output_as_dict(upload_response)
-    if upload_status_code != 200:
-        raise PipelineError(
-            "asr",
-            "cloud_asr_failed",
-            f"Qwen ASR 文件上传失败（HTTP {upload_status_code}）",
-            detail=json.dumps(
-                {
-                    "code": str(getattr(upload_response, "code", "") or (upload_response.get("code") if hasattr(upload_response, "get") else "")),
-                    "message": str(getattr(upload_response, "message", "") or (upload_response.get("message") if hasattr(upload_response, "get") else "")),
-                    "output": upload_output,
-                },
-                ensure_ascii=False,
-            )[:1200],
-        )
-
-    uploaded_files = upload_output.get("uploaded_files")
-    file_id = ""
-    if isinstance(uploaded_files, list):
-        for item in uploaded_files:
-            if not isinstance(item, dict):
-                continue
-            file_id = str(item.get("file_id") or "").strip()
-            if file_id:
-                break
-    if not file_id:
-        file_id = str(upload_output.get("file_id") or "").strip()
-    if not file_id:
-        raise PipelineError(
-            "asr",
-            "cloud_asr_failed",
-            "Qwen ASR 文件上传成功但未返回 file_id",
-            detail=json.dumps(upload_output, ensure_ascii=False)[:1200],
-        )
-
-    print(f"[DEBUG] Qwen ASR upload succeeded file_id={file_id}")
-    try:
-        file_meta_response = Files.get(file_id=file_id)
-    except Exception as exc:
-        raise PipelineError("asr", "cloud_asr_failed", "Qwen ASR 文件查询失败", detail=str(exc)[:1000]) from exc
-
-    file_meta_status_code = _status_code_to_int(getattr(file_meta_response, "status_code", 0))
-    file_meta_output = _dashscope_output_as_dict(file_meta_response)
-    if file_meta_status_code != 200:
-        raise PipelineError(
-            "asr",
-            "cloud_asr_failed",
-            f"Qwen ASR 文件查询失败（HTTP {file_meta_status_code}）",
-            detail=json.dumps(file_meta_output, ensure_ascii=False)[:1200],
-        )
-
-    signed_url = str(file_meta_output.get("url") or "").strip()
-    if not signed_url:
-        files_payload = file_meta_output.get("files")
-        if isinstance(files_payload, list):
-            for item in files_payload:
-                if not isinstance(item, dict):
-                    continue
-                candidate_url = str(item.get("url") or "").strip()
-                if candidate_url:
-                    signed_url = candidate_url
-                    break
-    if not signed_url:
-        raise PipelineError(
-            "asr",
-            "cloud_asr_failed",
-            "Qwen ASR 文件查询成功但未返回签名 URL",
-            detail=json.dumps(file_meta_output, ensure_ascii=False)[:1200],
-        )
-
-    transcription_kwargs: dict[str, Any] = {
-        "model": model,
-        "file_url": signed_url,
-        "enable_words": True,
-        "enable_itn": False,
-        "channel_id": [0],
-    }
-    normalized_language = _normalize_qwen_asr_language(language)
-    if normalized_language:
-        transcription_kwargs["language"] = normalized_language
-
-    optional_retry_keys = [key for key in ("language", "channel_id", "corpus") if key in transcription_kwargs]
-    task_response = None
-    task_status_code = 0
-    task_output: dict[str, Any] = {}
-
-    for attempt in range(2):
-        retry_without_optional = attempt == 1
-        request_kwargs = dict(transcription_kwargs)
-        if retry_without_optional:
-            for key in optional_retry_keys:
-                request_kwargs.pop(key, None)
-
-        print(
-            "[DEBUG] Qwen ASR task request "
-            f"attempt={attempt + 1} "
-            f"params={json.dumps(_build_qwen_request_log_params(request_kwargs), ensure_ascii=False)}"
-        )
-        try:
-            task_response = QwenTranscription.async_call(**request_kwargs)
-        except Exception as exc:
-            if (
-                not retry_without_optional
-                and optional_retry_keys
-                and _is_qwen_unknown_parameter_error(str(exc))
-            ):
-                print("[DEBUG] Qwen ASR task request fallback: retry without optional parameters")
-                continue
-            raise PipelineError("asr", "cloud_asr_failed", "Qwen ASR 任务创建失败", detail=str(exc)[:1000]) from exc
-
-        task_status_code = _status_code_to_int(getattr(task_response, "status_code", 0))
-        task_output = _dashscope_output_as_dict(task_response)
-        if task_status_code == 200:
-            break
-
-        task_error_text = json.dumps(
-            {
-                "code": str(getattr(task_response, "code", "") or ""),
-                "message": str(getattr(task_response, "message", "") or ""),
-                "output": task_output,
-            },
-            ensure_ascii=False,
-        )[:1200]
-        if (
-            not retry_without_optional
-            and optional_retry_keys
-            and _is_qwen_unknown_parameter_error(task_error_text)
-        ):
-            print("[DEBUG] Qwen ASR task request fallback: response indicates unknown optional parameter")
-            continue
-        raise PipelineError(
-            "asr",
-            "cloud_asr_failed",
-            f"Qwen ASR 任务创建失败（HTTP {task_status_code}）",
-            detail=task_error_text,
-        )
-    else:
-        raise PipelineError(
-            "asr",
-            "cloud_asr_failed",
-            "Qwen ASR 任务创建失败（参数降级重试后仍失败）",
-            detail=json.dumps(task_output, ensure_ascii=False)[:1200],
-        )
-
-    if task_response is None:
-        raise PipelineError("asr", "cloud_asr_failed", "Qwen ASR 任务创建失败（空响应）")
-
-    task_id = str(task_output.get("task_id") or getattr(getattr(task_response, "output", None), "task_id", "")).strip()
-    if not task_id:
-        raise PipelineError(
-            "asr",
-            "cloud_asr_failed",
-            "Qwen ASR 任务创建成功但缺少 task_id",
-            detail=json.dumps(task_output, ensure_ascii=False)[:1200],
-        )
-
-    print(f"[DEBUG] Qwen ASR task created task_id={task_id}")
-    try:
-        transcription_response = QwenTranscription.wait(task=task_id)
-    except Exception as exc:
-        raise PipelineError("asr", "cloud_asr_failed", "Qwen ASR 任务轮询失败", detail=str(exc)[:1000]) from exc
-
-    wait_status_code = _status_code_to_int(getattr(transcription_response, "status_code", 0))
-    wait_output = _dashscope_output_as_dict(transcription_response)
-    if wait_status_code != 200:
-        raise PipelineError(
-            "asr",
-            "cloud_asr_failed",
-            f"Qwen ASR 任务轮询失败（HTTP {wait_status_code}）",
-            detail=json.dumps(wait_output, ensure_ascii=False)[:1200],
-        )
-
-    task_status = str(wait_output.get("task_status") or "").strip().upper()
-    if task_status != "SUCCEEDED":
-        failed_code = str(wait_output.get("code") or "").strip()
-        failed_message = str(wait_output.get("message") or "未知错误").strip()
-        raise PipelineError(
-            "asr",
-            "cloud_asr_failed",
-            "Qwen ASR 云端识别失败",
-            detail=json.dumps(
-                {
-                    "subtask_code": failed_code,
-                    "subtask_message": failed_message,
-                },
-                ensure_ascii=False,
-            )[:1200],
-        )
-
-    transcription_result = wait_output.get("result")
-    transcription_url = ""
-    if isinstance(transcription_result, dict):
-        transcription_url = str(transcription_result.get("transcription_url") or "").strip()
-
-    results = wait_output.get("results")
-    if not transcription_url and isinstance(results, list):
-        for item in results:
-            if not isinstance(item, dict):
-                continue
-            if str(item.get("subtask_status") or "").strip().upper() != "SUCCEEDED":
-                continue
-            transcription_url = str(item.get("transcription_url") or "").strip()
-            if transcription_url:
-                break
-
-    if not transcription_url:
-        raise PipelineError(
-            "asr",
-            "cloud_asr_failed",
-            "Qwen ASR 识别成功但缺少 transcription_url",
-            detail=json.dumps(wait_output, ensure_ascii=False)[:1200],
-        )
-
-    try:
-        transcription_file_response = requests.get(transcription_url, timeout=120)
-    except Exception as exc:
-        raise PipelineError("asr", "cloud_asr_failed", "Qwen ASR 结果下载失败", detail=str(exc)[:1000]) from exc
-
-    if transcription_file_response.status_code != 200:
-        raise PipelineError(
-            "asr",
-            "cloud_asr_failed",
-            f"Qwen ASR 结果下载失败（HTTP {transcription_file_response.status_code}）",
-            detail=transcription_file_response.text[:800],
-        )
-
-    try:
-        payload = transcription_file_response.json()
-    except Exception as exc:
-        raise PipelineError(
-            "asr",
-            "cloud_asr_invalid_json",
-            "云端 ASR 返回非 JSON 响应",
-            detail=transcription_file_response.text[:500],
-        ) from exc
-
-    segments = _extract_segments_from_paraformer_payload(payload)
-    if segments is None:
-        payload_keys = list(payload.keys()) if isinstance(payload, dict) else [type(payload).__name__]
-        raise PipelineError(
-            "asr",
-            "cloud_asr_failed",
-            "Qwen ASR 云端识别结果缺少可解析分句",
-            detail=json.dumps({"keys": payload_keys}, ensure_ascii=False),
-        )
-    return segments
+    return _transcribe_cloud_openai_compatible(
+        audio_path,
+        whisper,
+        model=model,
+        model_label="Qwen ASR",
+    )
 
 
 def _transcribe_local(

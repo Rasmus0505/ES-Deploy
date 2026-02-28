@@ -199,14 +199,50 @@ def _build_oneapi_user_llm_payload(*, access_token: str, raw_llm: dict | None = 
     )
 
 
-def _inject_job_llm_options_from_principal(*, options: dict, principal: AuthPrincipal) -> dict:
+def _build_oneapi_user_whisper_payload(*, access_token: str, raw_whisper: dict | None = None) -> dict:
+    safe = raw_whisper if isinstance(raw_whisper, dict) else {}
+    runtime = str(safe.get("runtime") or "cloud").strip().lower()
+    if runtime not in {"cloud", "local"}:
+        runtime = "cloud"
+    default_model = "small" if runtime == "local" else "paraformer-v2"
+    model = str(safe.get("model") or "").strip() or default_model
+    language = str(safe.get("language") or "").strip() or "en"
+    if runtime == "cloud":
+        return {
+            "runtime": "cloud",
+            "model": model,
+            "language": language,
+            "base_url": ONEAPI_V1_BASE_URL,
+            "api_key": str(access_token or "").strip(),
+        }
+    return {
+        "runtime": "local",
+        "model": model,
+        "language": language,
+        "base_url": str(safe.get("base_url") or "").strip(),
+        "api_key": str(safe.get("api_key") or "").strip(),
+    }
+
+
+def _inject_job_model_options_from_principal(*, options: dict, principal: AuthPrincipal) -> dict:
     safe_options = dict(options if isinstance(options, dict) else {})
     llm_raw = safe_options.get("llm") if isinstance(safe_options.get("llm"), dict) else {}
     safe_options["llm"] = _build_oneapi_user_llm_payload(
         access_token=principal.access_token,
         raw_llm=llm_raw if isinstance(llm_raw, dict) else None,
     )
+    whisper_raw = safe_options.get("whisper") if isinstance(safe_options.get("whisper"), dict) else {}
+    safe_options["whisper"] = _build_oneapi_user_whisper_payload(
+        access_token=principal.access_token,
+        raw_whisper=whisper_raw if isinstance(whisper_raw, dict) else None,
+    )
     return safe_options
+
+
+def _inject_subtitle_options_from_principal(*, payload: SubtitleJobOptions, principal: AuthPrincipal) -> SubtitleJobOptions:
+    raw_options = payload.model_dump()
+    injected = _inject_job_model_options_from_principal(options=raw_options, principal=principal)
+    return SubtitleJobOptions.model_validate(injected)
 
 
 app = FastAPI(title="Listening Subtitle Backend", version="0.1.0")
@@ -1069,7 +1105,7 @@ def test_subtitle_config(
     payload: SubtitleJobOptions,
     principal: AuthPrincipal = Depends(_require_principal),
 ) -> SubtitleConfigTestResponse:
-    _ = principal
+    payload = _inject_subtitle_options_from_principal(payload=payload, principal=principal)
     llm_result, llm_usage = _normalize_llm_probe_output(_test_llm_config(payload))
     whisper_result = _test_whisper_config(payload)
     if llm_result.ok and whisper_result.ok:
@@ -1097,7 +1133,7 @@ def test_subtitle_config_llm(
     payload: SubtitleJobOptions,
     principal: AuthPrincipal = Depends(_require_principal),
 ) -> SubtitleConfigTestResponse:
-    _ = principal
+    payload = _inject_subtitle_options_from_principal(payload=payload, principal=principal)
     llm_result, llm_usage = _normalize_llm_probe_output(_test_llm_config(payload))
     whisper_placeholder = SubtitleConfigProbeResult(ok=True, message="已跳过（本次仅测试 LLM）")
     status = "ok" if llm_result.ok else "failed"
@@ -1120,7 +1156,7 @@ def test_subtitle_config_whisper(
     payload: SubtitleJobOptions,
     principal: AuthPrincipal = Depends(_require_principal),
 ) -> SubtitleConfigTestResponse:
-    _ = principal
+    payload = _inject_subtitle_options_from_principal(payload=payload, principal=principal)
     whisper_result = _test_whisper_config(payload)
     llm_placeholder = SubtitleConfigProbeResult(ok=True, message="已跳过（本次仅测试 Whisper）")
     status = "ok" if whisper_result.ok else "failed"
@@ -1586,7 +1622,7 @@ async def create_subtitle_job(
 
     options = SubtitleJobOptions.model_validate(raw_options)
     options_dict = _validate_subtitle_job_options(options)
-    options_dict = _inject_job_llm_options_from_principal(options=options_dict, principal=principal)
+    options_dict = _inject_job_model_options_from_principal(options=options_dict, principal=principal)
 
     capacity = job_manager.check_submit_capacity(user_id=principal.user_id)
     if not bool(capacity.get("ok")):
@@ -1645,7 +1681,7 @@ def create_subtitle_job_from_url(
         raise HTTPException(status_code=400, detail=exc.message) from exc
 
     options_dict = _validate_subtitle_job_options(payload.options)
-    options_dict = _inject_job_llm_options_from_principal(options=options_dict, principal=principal)
+    options_dict = _inject_job_model_options_from_principal(options=options_dict, principal=principal)
 
     capacity = job_manager.check_submit_capacity(user_id=principal.user_id)
     if not bool(capacity.get("ok")):

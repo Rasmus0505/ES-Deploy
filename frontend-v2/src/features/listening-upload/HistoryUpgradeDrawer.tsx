@@ -1,5 +1,5 @@
-import { Eye, EyeOff, Link as LinkIcon, Plus, Trash2, Upload } from 'lucide-react';
-import { useEffect, useMemo, useState, type ChangeEvent } from 'react';
+import { Link as LinkIcon, Upload } from 'lucide-react';
+import { useEffect, useMemo, type ChangeEvent } from 'react';
 import { Badge } from '../../components/ui/badge';
 import { Button } from '../../components/ui/button';
 import {
@@ -43,19 +43,8 @@ type HistoryUpgradeDrawerProps = {
   sourceFileName?: string;
   onSourceUrlChange: (value: string) => void;
   onSourceFileChange: (file: File | null) => void;
-  whisperBaseUrlOptions: ReadonlyArray<{ value: string; label: string }>;
-  newWhisperBaseUrlInput: string;
-  onNewWhisperBaseUrlInputChange: (value: string) => void;
-  onAddCustomWhisperBaseUrl: () => void;
-  onRemoveCurrentCustomWhisperBaseUrl: () => void;
-  canRemoveCurrentCustomWhisperBaseUrl: boolean;
-  whisperBaseUrlManageError: string;
   options: SubtitleOptionForm;
-  onOptionChange: <K extends keyof SubtitleOptionForm>(
-    key: K,
-    value: SubtitleOptionForm[K],
-    options?: { silentWhisperRestore?: boolean }
-  ) => void;
+  onOptionChange: <K extends keyof SubtitleOptionForm>(key: K, value: SubtitleOptionForm[K]) => void;
 };
 
 const WHISPER_RUNTIME_OPTIONS = [
@@ -99,23 +88,11 @@ export function HistoryUpgradeDrawer({
   sourceFileName = '',
   onSourceUrlChange,
   onSourceFileChange,
-  whisperBaseUrlOptions,
-  newWhisperBaseUrlInput,
-  onNewWhisperBaseUrlInputChange,
-  onAddCustomWhisperBaseUrl,
-  onRemoveCurrentCustomWhisperBaseUrl,
-  canRemoveCurrentCustomWhisperBaseUrl,
-  whisperBaseUrlManageError,
   options,
   onOptionChange
 }: HistoryUpgradeDrawerProps) {
-  const [showHistoryUpgradeWhisperApiKey, setShowHistoryUpgradeWhisperApiKey] = useState(false);
-  const updateOption = <K extends keyof SubtitleOptionForm>(
-    key: K,
-    value: SubtitleOptionForm[K],
-    nextOptions?: { silentWhisperRestore?: boolean }
-  ) => {
-    onOptionChange(key, value, nextOptions);
+  const updateOption = <K extends keyof SubtitleOptionForm>(key: K, value: SubtitleOptionForm[K]) => {
+    onOptionChange(key, value);
   };
   const currentWhisperModelBaseOptions = useMemo(
     () => (options.whisperRuntime === 'local' ? LOCAL_WHISPER_MODEL_OPTIONS : CLOUD_WHISPER_MODEL_OPTIONS),
@@ -133,14 +110,8 @@ export function HistoryUpgradeDrawer({
     if (currentWhisperModelBaseOptions.some((item) => item.value === currentModel)) return;
     const fallbackModel = currentWhisperModelBaseOptions[0]?.value || '';
     if (!fallbackModel) return;
-    updateOption('whisperModel', fallbackModel, { silentWhisperRestore: true });
+    updateOption('whisperModel', fallbackModel);
   }, [currentWhisperModelBaseOptions, options.whisperModel]);
-
-  useEffect(() => {
-    if (!open) {
-      setShowHistoryUpgradeWhisperApiKey(false);
-    }
-  }, [open]);
 
   return (
     <Drawer open={open} onOpenChange={onOpenChange} direction="right">
@@ -242,60 +213,6 @@ export function HistoryUpgradeDrawer({
                   ))}
                 </Select>
               </div>
-              {options.whisperRuntime === 'cloud' ? (
-                <div className="grid gap-2 md:col-span-2">
-                  <Label htmlFor="historyUpgradeWhisperBaseUrl">字幕生成 URL</Label>
-                  <div className="grid gap-2">
-                    <Select
-                      id="historyUpgradeWhisperBaseUrl"
-                      value={options.whisperBaseUrl}
-                      onChange={(event) => updateOption('whisperBaseUrl', event.target.value)}
-                    >
-                      {whisperBaseUrlOptions.map((item) => (
-                        <option key={item.value} value={item.value}>{item.label}</option>
-                      ))}
-                    </Select>
-                    <InputGroup className="upload-url-input-group">
-                      <InputGroupInput
-                        id="historyUpgradeWhisperBaseUrlCustomInput"
-                        placeholder="新增自定义 URL（https://...）"
-                        value={newWhisperBaseUrlInput}
-                        onChange={(event) => onNewWhisperBaseUrlInputChange(event.target.value)}
-                        onKeyDown={(event) => {
-                          if (event.key === 'Enter') {
-                            event.preventDefault();
-                            onAddCustomWhisperBaseUrl();
-                          }
-                        }}
-                      />
-                      <InputGroupAddon align="inline-end">
-                        <InputGroupButton
-                          aria-label="添加字幕生成 URL"
-                          title="添加字幕生成 URL"
-                          size="icon-xs"
-                          onClick={onAddCustomWhisperBaseUrl}
-                        >
-                          <Plus />
-                        </InputGroupButton>
-                        <InputGroupButton
-                          aria-label="删除当前自定义字幕生成 URL"
-                          title="删除当前自定义字幕生成 URL"
-                          size="icon-xs"
-                          disabled={!canRemoveCurrentCustomWhisperBaseUrl}
-                          onClick={onRemoveCurrentCustomWhisperBaseUrl}
-                        >
-                          <Trash2 />
-                        </InputGroupButton>
-                      </InputGroupAddon>
-                    </InputGroup>
-                    {whisperBaseUrlManageError ? (
-                      <TypographySmall className="error-text">{whisperBaseUrlManageError}</TypographySmall>
-                    ) : (
-                      <TypographySmall>可新增并保存自定义 URL，仅自定义项支持删除。</TypographySmall>
-                    )}
-                  </div>
-                </div>
-              ) : null}
               <div className="grid gap-2">
                 <Label htmlFor="historyUpgradeWhisperModel">字幕生成模型</Label>
                 <Select
@@ -309,27 +226,11 @@ export function HistoryUpgradeDrawer({
                 </Select>
               </div>
             </div>
-            <div className="grid gap-2">
-              <Label htmlFor="historyUpgradeWhisperApiKey">字幕生成 API Key</Label>
-              <InputGroup>
-                <InputGroupInput
-                  id="historyUpgradeWhisperApiKey"
-                  type={showHistoryUpgradeWhisperApiKey ? 'text' : 'password'}
-                  value={options.whisperApiKey}
-                  onChange={(event) => updateOption('whisperApiKey', event.target.value)}
-                />
-                <InputGroupAddon align="inline-end">
-                  <InputGroupButton
-                    size="icon-xs"
-                    aria-label={`${showHistoryUpgradeWhisperApiKey ? '隐藏' : '显示'} 字幕生成 API Key（升级抽屉）`}
-                    title={`${showHistoryUpgradeWhisperApiKey ? '隐藏' : '显示'} 字幕生成 API Key（升级抽屉）`}
-                    onClick={() => setShowHistoryUpgradeWhisperApiKey((prev) => !prev)}
-                  >
-                    {showHistoryUpgradeWhisperApiKey ? <EyeOff /> : <Eye />}
-                  </InputGroupButton>
-                </InputGroupAddon>
-              </InputGroup>
-            </div>
+            {options.whisperRuntime === 'cloud' ? (
+              <TypographySmall>
+                云端识别会自动使用当前账号的 OneAPI 令牌与托管通道，无需填写 URL 或 API Key。
+              </TypographySmall>
+            ) : null}
           </section>
 
         </div>
