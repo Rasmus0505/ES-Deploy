@@ -37,6 +37,12 @@ _CACHE_ROOT = Path(__file__).resolve().parents[1] / "runtime" / "source-cache"
 _CACHE_DB = _CACHE_ROOT / "index.sqlite3"
 _DOWNLOAD_CONCURRENCY_LIMIT = max(1, int(float(os.getenv("URL_SOURCE_DOWNLOAD_CONCURRENCY", "3"))))
 _DOWNLOAD_SEMAPHORE = threading.BoundedSemaphore(_DOWNLOAD_CONCURRENCY_LIMIT)
+_DEFAULT_YTDLP_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+)
+_DEFAULT_BILIBILI_REFERER = "https://www.bilibili.com/"
+_DEFAULT_BILIBILI_ORIGIN = "https://www.bilibili.com"
 _SOURCE_ALLOWED_DOMAINS_DEFAULT = (
     "youtube.com",
     "youtu.be",
@@ -592,6 +598,41 @@ def _resolve_yt_dlp_commands() -> list[tuple[list[str], str]]:
     return deduped
 
 
+def _is_bilibili_source_url(url: str) -> bool:
+    host = _parse_host_from_url(url)
+    if not host:
+        return False
+    return host == "bilibili.com" or host.endswith(".bilibili.com") or host == "b23.tv" or host.endswith(".b23.tv")
+
+
+def _resolve_yt_dlp_cookies_args() -> list[str]:
+    cookies_file_raw = str(os.getenv("YT_DLP_COOKIES_FILE", "")).strip()
+    if not cookies_file_raw:
+        return []
+    cookies_file = Path(cookies_file_raw).expanduser()
+    if not cookies_file.is_file():
+        print(f"[DEBUG] YT_DLP_COOKIES_FILE not found: {cookies_file}")
+        return []
+    return ["--cookies", str(cookies_file)]
+
+
+def _build_yt_dlp_request_args(source_url: str) -> list[str]:
+    args: list[str] = []
+    user_agent = str(os.getenv("YT_DLP_USER_AGENT", "")).strip() or _DEFAULT_YTDLP_USER_AGENT
+    if user_agent:
+        args.extend(["--user-agent", user_agent])
+
+    if _is_bilibili_source_url(source_url):
+        referer = str(os.getenv("YT_DLP_BILIBILI_REFERER", _DEFAULT_BILIBILI_REFERER)).strip() or _DEFAULT_BILIBILI_REFERER
+        origin = str(os.getenv("YT_DLP_BILIBILI_ORIGIN", _DEFAULT_BILIBILI_ORIGIN)).strip() or _DEFAULT_BILIBILI_ORIGIN
+        args.extend(["--add-header", f"Referer:{referer}"])
+        args.extend(["--add-header", f"Origin:{origin}"])
+        args.extend(["--add-header", "Accept-Language:zh-CN,zh;q=0.9,en;q=0.8"])
+        args.extend(_resolve_yt_dlp_cookies_args())
+
+    return args
+
+
 def _run_download(
     *,
     command: list[str],
@@ -604,6 +645,7 @@ def _run_download(
     safe_timeout = max(60, int(timeout_seconds or _DOWNLOAD_TIMEOUT_SECONDS))
     marker = f"source_{int(time.time() * 1000)}"
     output_template = str((output_root / f"{marker}.%(ext)s").resolve())
+    request_args = _build_yt_dlp_request_args(source_url)
 
     args = [
         *command,
@@ -617,9 +659,13 @@ def _run_download(
         "mp4",
         "--output",
         output_template,
+        *request_args,
         "--",
         source_url,
     ]
+
+    if request_args:
+        print(f"[DEBUG] yt-dlp extra request args enabled for url={source_url}")
 
     try:
         process = subprocess.Popen(
@@ -739,7 +785,17 @@ def _build_failure_detail(*, stdout: str, stderr: str) -> str:
         str(stdout or "").strip(),
     ]).strip()
     text = re.sub(r"\s+", " ", text)
-    return text[:700] if text else "yt-dlp command failed without diagnostic output"
+    if not text:
+        return "yt-dlp command failed without diagnostic output"
+
+    lowered = text.lower()
+    if ("bilibili" in lowered or "b23.tv" in lowered) and ("http error 412" in lowered or "precondition failed" in lowered):
+        text = (
+            "B站风控拦截（HTTP 412）。请在后端配置 YT_DLP_COOKIES_FILE（登录后导出的 cookies.txt）再重试。"
+            f" 原始错误: {text}"
+        )
+
+    return text[:900]
 
 
 def _terminate_process(process: subprocess.Popen[str]) -> None:
