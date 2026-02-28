@@ -64,8 +64,13 @@ npm run dev -- --host 127.0.0.1 --port 8510 --strictPort
 - `YT_DLP_EXECUTABLE`：`yt-dlp` 可执行路径（Zeabur 建议显式配置）
 - `YT_DLP_COOKIES_FILE`：可选，`cookies.txt` 文件路径（B 站 412 风控时建议配置）
 - `YT_DLP_BILIBILI_COOKIE`：可选，直接填写 B 站 Cookie 字符串（无需上传 cookies.txt，优先于 `YT_DLP_COOKIES_FILE`）
+- `YT_DLP_SITE_COOKIE_MAP_JSON`：可选，按域名配置 Cookie（JSON，如 `{"bilibili.com":"SESSDATA=...; bili_jct=...","youtube.com":"SID=..."}`），对所有用户统一生效
+- `YT_DLP_SITE_HEADER_MAP_JSON`：可选，按域名追加请求头（JSON，如 `{"example.com":{"Referer":"https://example.com"}}`）
+- `YT_DLP_PROXY_POOL`：可选，代理池（逗号分隔或 JSON 数组），命中 412/429 等风控错误时自动轮换重试
+- `YT_DLP_EXTRA_ARGS`：可选，附加给 `yt-dlp` 的参数字符串（如 `--extractor-retries 3 --retry-sleep extractor:exp=1:20`）
 - `YT_DLP_USER_AGENT`：可选，下载请求 UA（默认内置 Chrome UA）
 - `YT_DLP_BILIBILI_REFERER`：可选，B 站下载 Referer（默认 `https://www.bilibili.com/`）
+- `YUTTO_EXECUTABLE`：可选，`yutto` 可执行路径（仅 B 站触发 412 时作为二级兜底）
 - `PIP_CACHE_DIR`：建议设置为持久卷路径（如 `/data/pip-cache`），减少重复部署下载依赖时间
 - `PIP_DISABLE_PIP_VERSION_CHECK=1`：关闭 pip 版本检查，缩短安装准备阶段
 
@@ -82,7 +87,8 @@ npm run dev -- --host 127.0.0.1 --port 8510 --strictPort
 
 若 `ffmpeg/ffprobe=false`：在 Zeabur 添加系统包 `ffmpeg`。  
 若 `ytdlp=false`：确认容器内 `yt-dlp` 可执行存在，必要时设置 `YT_DLP_EXECUTABLE`。
-若 B 站链接报 `HTTP 412 Precondition Failed`：优先配置 `YT_DLP_BILIBILI_COOKIE`（浏览器复制 Cookie 字符串）或 `YT_DLP_COOKIES_FILE`（登录后导出的 cookies.txt），再重试同一链接。
+若需启用 B 站二级兜底：在后端容器安装 `yutto`（如 `pip install yutto`），必要时设置 `YUTTO_EXECUTABLE`。
+若 B 站链接报 `HTTP 412 Precondition Failed`：系统会先自动走 `yt-dlp` 主链路，再触发代理池重试（`YT_DLP_PROXY_POOL`），最后尝试 `yutto` 兜底（若已安装并可执行）。建议至少配置 `YT_DLP_BILIBILI_COOKIE` 或 `YT_DLP_SITE_COOKIE_MAP_JSON`，并准备 `YT_DLP_COOKIES_FILE` 作为通用后备。
 
 ### 前端服务
 

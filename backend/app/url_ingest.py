@@ -4,8 +4,10 @@ import importlib.util
 import functools
 import hashlib
 import ipaddress
+import json
 import os
 import re
+import shlex
 import shutil
 import socket
 import sqlite3
@@ -54,6 +56,29 @@ _SOURCE_ALLOWED_DOMAINS = tuple(
     for item in str(os.getenv("URL_SOURCE_ALLOWED_DOMAINS", ",".join(_SOURCE_ALLOWED_DOMAINS_DEFAULT))).split(",")
     if str(item or "").strip()
 )
+_DOWNLOAD_SIDE_CAR_EXTENSIONS = {
+    ".part",
+    ".ytdl",
+    ".json",
+    ".description",
+    ".jpg",
+    ".jpeg",
+    ".png",
+    ".webp",
+    ".vtt",
+    ".srt",
+    ".ass",
+    ".lrc",
+    ".txt",
+    ".xml",
+}
+_PRIMARY_MEDIA_EXTENSIONS = {
+    ".mp4",
+    ".mkv",
+    ".mov",
+    ".webm",
+    ".flv",
+}
 
 
 def _is_valid_http_url(value: str) -> bool:
@@ -507,7 +532,6 @@ def download_video_from_url(
         materialized = _materialize_cached_video(cached_video=cached_hit, output_root=output_root)
         if callable(on_progress):
             on_progress(100, "已复用缓存视频，准备提取音频")
-        print(f"[DEBUG] URL ingest cache hit: url={safe_url} file={cached_hit}")
         return str(materialized)
 
     commands = _resolve_yt_dlp_commands()
@@ -528,30 +552,46 @@ def download_video_from_url(
             detail=f"limit={_DOWNLOAD_CONCURRENCY_LIMIT}",
         )
     try:
-        last_error: PipelineError | None = None
-        for command, source in commands:
-            try:
-                print(f"[DEBUG] URL ingest using yt-dlp source: {source}")
-                downloaded = _run_download(
-                    command=command,
+        downloaded, last_error = _attempt_yt_dlp_download(
+            commands=commands,
+            source_url=safe_url,
+            output_root=output_root,
+            should_cancel=should_cancel,
+            on_progress=on_progress,
+            timeout_seconds=timeout_seconds,
+            proxy_url="",
+        )
+        if downloaded:
+            _record_download_to_cache_best_effort(normalized_url=safe_url, downloaded=downloaded)
+            return downloaded
+
+        if last_error and _should_retry_with_proxy(last_error):
+            for proxy_url in _resolve_proxy_pool():
+                print(f"[DEBUG] download retry with proxy={proxy_url}")
+                downloaded, last_error = _attempt_yt_dlp_download(
+                    commands=commands,
                     source_url=safe_url,
                     output_root=output_root,
                     should_cancel=should_cancel,
                     on_progress=on_progress,
                     timeout_seconds=timeout_seconds,
+                    proxy_url=proxy_url,
                 )
-                try:
-                    _record_downloaded_file_to_cache(normalized_url=safe_url, downloaded_path=Path(downloaded))
-                except Exception as cache_exc:
-                    print(f"[DEBUG] URL ingest cache store failed: {cache_exc}")
-                print(f"[DEBUG] URL ingest downloaded file: {downloaded}")
-                return downloaded
-            except PipelineError as exc:
-                last_error = exc
-                if exc.code in {"yt_dlp_launch_failed", "yt_dlp_command_failed", "download_output_missing"}:
-                    print(f"[DEBUG] yt-dlp source failed ({source}): {exc.code} -> {exc.message}")
-                    continue
-                raise
+                if downloaded:
+                    _record_download_to_cache_best_effort(normalized_url=safe_url, downloaded=downloaded)
+                    return downloaded
+
+        if _is_bilibili_source_url(safe_url) and last_error and _is_antibot_failure(last_error.detail):
+            fallback_file = _run_yutto_fallback_download(
+                source_url=safe_url,
+                output_root=output_root,
+                should_cancel=should_cancel,
+                on_progress=on_progress,
+                timeout_seconds=timeout_seconds,
+            )
+            if fallback_file:
+                _record_download_to_cache_best_effort(normalized_url=safe_url, downloaded=fallback_file)
+                return fallback_file
 
         detail = last_error.detail if last_error else "unknown"
         raise PipelineError(
@@ -562,6 +602,212 @@ def download_video_from_url(
         )
     finally:
         _DOWNLOAD_SEMAPHORE.release()
+
+
+def _attempt_yt_dlp_download(
+    *,
+    commands: list[tuple[list[str], str]],
+    source_url: str,
+    output_root: Path,
+    should_cancel: CancelCheck | None,
+    on_progress: ProgressCallback | None,
+    timeout_seconds: int,
+    proxy_url: str,
+) -> tuple[str | None, PipelineError | None]:
+    last_error: PipelineError | None = None
+    for command, source in commands:
+        try:
+            downloaded = _run_download(
+                command=command,
+                source_url=source_url,
+                output_root=output_root,
+                should_cancel=should_cancel,
+                on_progress=on_progress,
+                timeout_seconds=timeout_seconds,
+                proxy_url=proxy_url,
+            )
+            return downloaded, None
+        except PipelineError as exc:
+            last_error = exc
+            if exc.code in {"yt_dlp_launch_failed", "yt_dlp_command_failed", "download_output_missing"}:
+                print(f"[DEBUG] yt-dlp source failed source={source} code={exc.code} proxy={proxy_url or '-'}")
+                continue
+            raise
+    return None, last_error
+
+
+def _record_download_to_cache_best_effort(*, normalized_url: str, downloaded: str) -> None:
+    try:
+        _record_downloaded_file_to_cache(normalized_url=normalized_url, downloaded_path=Path(downloaded))
+    except Exception:
+        return
+
+
+def _extract_sessdata_from_cookie(cookie_header: str) -> str:
+    matched = re.search(r"(?:^|;\s*)SESSDATA=([^;]+)", str(cookie_header or ""), flags=re.IGNORECASE)
+    if not matched:
+        return ""
+    return str(matched.group(1) or "").strip()
+
+
+def _resolve_yutto_sessdata(source_url: str) -> str:
+    cookie_header = _resolve_bilibili_cookie_header() or _resolve_site_cookie_header(source_url)
+    if not cookie_header:
+        return ""
+    return _extract_sessdata_from_cookie(cookie_header)
+
+
+def _run_yutto_fallback_download(
+    *,
+    source_url: str,
+    output_root: Path,
+    should_cancel: CancelCheck | None,
+    on_progress: ProgressCallback | None,
+    timeout_seconds: int,
+) -> str | None:
+    commands = _resolve_yutto_commands()
+    if not commands:
+        print("[DEBUG] yutto fallback skipped: executable not found")
+        return None
+
+    if callable(on_progress):
+        on_progress(20, "触发 B 站反爬兜底，尝试 yutto 下载")
+
+    last_error: PipelineError | None = None
+    for command, source in commands:
+        try:
+            print(f"[DEBUG] yutto fallback using source={source}")
+            return _run_single_yutto_download(
+                command=command,
+                source_url=source_url,
+                output_root=output_root,
+                should_cancel=should_cancel,
+                on_progress=on_progress,
+                timeout_seconds=timeout_seconds,
+            )
+        except PipelineError as exc:
+            if exc.code == "cancel_requested":
+                raise
+            last_error = exc
+            print(f"[DEBUG] yutto fallback failed source={source} code={exc.code}")
+            continue
+
+    if last_error:
+        print(f"[DEBUG] yutto fallback exhausted detail={str(last_error.detail or '')[:320]}")
+    return None
+
+
+def _run_single_yutto_download(
+    *,
+    command: list[str],
+    source_url: str,
+    output_root: Path,
+    should_cancel: CancelCheck | None,
+    on_progress: ProgressCallback | None,
+    timeout_seconds: int,
+) -> str:
+    safe_timeout = max(60, int(timeout_seconds or _DOWNLOAD_TIMEOUT_SECONDS))
+    marker = f"source_yutto_{int(time.time() * 1000)}"
+    staging_root = (output_root / f"{marker}_tmp").resolve()
+    staging_root.mkdir(parents=True, exist_ok=True)
+    try:
+        sessdata = _resolve_yutto_sessdata(source_url)
+        args = [
+            *command,
+            "download",
+            source_url,
+            "--dir",
+            str(staging_root),
+            "--no-danmaku",
+            "--no-subtitle",
+            "--no-cover",
+            "--no-chapter-info",
+            "--no-progress",
+            "--no-color",
+        ]
+        if sessdata:
+            args.extend(["--sessdata", sessdata])
+
+        try:
+            process = subprocess.Popen(
+                args,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+            )
+        except Exception as exc:
+            raise PipelineError(
+                stage="download_source",
+                code="yutto_launch_failed",
+                message="无法启动 yutto 兜底下载进程",
+                detail=str(exc)[:500],
+            ) from exc
+
+        started_at = time.monotonic()
+        last_progress_second = -1
+        while True:
+            if callable(should_cancel) and bool(should_cancel()):
+                _terminate_process(process)
+                raise PipelineError(
+                    stage="download_source",
+                    code="cancel_requested",
+                    message="任务取消请求已接收，已停止下载",
+                )
+
+            return_code = process.poll()
+            if return_code is not None:
+                break
+
+            elapsed = time.monotonic() - started_at
+            elapsed_sec = max(0, int(elapsed))
+            if callable(on_progress) and elapsed_sec != last_progress_second:
+                pseudo_percent = max(0, min(95, 10 + elapsed_sec * 3))
+                on_progress(pseudo_percent, "B站兜底下载进行中")
+                last_progress_second = elapsed_sec
+            if elapsed > safe_timeout:
+                _terminate_process(process)
+                raise PipelineError(
+                    stage="download_source",
+                    code="download_timeout",
+                    message="下载超时，请稍后重试",
+                    detail=f"timeout_seconds={safe_timeout}",
+                )
+            time.sleep(0.3)
+
+        stdout, stderr = process.communicate()
+        if process.returncode != 0:
+            detail_text = _build_failure_detail(stdout=stdout, stderr=stderr)
+            raise PipelineError(
+                stage="download_source",
+                code="yutto_command_failed",
+                message="yutto 兜底下载失败",
+                detail=detail_text,
+            )
+
+        resolved = _resolve_latest_media_file(search_root=staging_root, recursive=True)
+        if not resolved:
+            detail_text = _build_failure_detail(stdout=stdout, stderr=stderr)
+            raise PipelineError(
+                stage="download_source",
+                code="download_output_missing",
+                message="yutto 下载完成但未找到可用媒体文件",
+                detail=detail_text,
+            )
+
+        target = output_root / f"{marker}{resolved.suffix.lower() or '.mp4'}"
+        try:
+            shutil.move(str(resolved), str(target))
+        except Exception:
+            shutil.copy2(resolved, target)
+
+        if callable(on_progress):
+            on_progress(100, "素材下载完成，准备提取音频")
+
+        return str(target)
+    finally:
+        shutil.rmtree(staging_root, ignore_errors=True)
 
 
 def _resolve_yt_dlp_commands() -> list[tuple[list[str], str]]:
@@ -598,6 +844,31 @@ def _resolve_yt_dlp_commands() -> list[tuple[list[str], str]]:
     return deduped
 
 
+def _resolve_yutto_commands() -> list[tuple[list[str], str]]:
+    commands: list[tuple[list[str], str]] = []
+
+    configured_exec = str(os.getenv("YUTTO_EXECUTABLE", "")).strip()
+    if configured_exec:
+        commands.append(([configured_exec], f"env-exec:{configured_exec}"))
+
+    which_exec = shutil.which("yutto")
+    if which_exec:
+        commands.append(([which_exec], f"path-exec:{which_exec}"))
+
+    if importlib.util.find_spec("yutto") is not None:
+        commands.append(([sys.executable, "-m", "yutto"], "python-module:yutto"))
+
+    deduped: list[tuple[list[str], str]] = []
+    seen: set[str] = set()
+    for command, source in commands:
+        key = "\u0000".join(command)
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append((command, source))
+    return deduped
+
+
 def _is_bilibili_source_url(url: str) -> bool:
     host = _parse_host_from_url(url)
     if not host:
@@ -616,14 +887,167 @@ def _resolve_yt_dlp_cookies_args() -> list[str]:
     return ["--cookies", str(cookies_file)]
 
 
+def _sanitize_cookie_header(raw_cookie: str) -> str:
+    sanitized = re.sub(r"[\r\n]+", " ", str(raw_cookie or "")).strip()
+    if sanitized.lower().startswith("cookie:"):
+        sanitized = sanitized.split(":", 1)[1].strip()
+    return sanitized
+
+
+def _match_domain_mapped_value(*, source_url: str, mapping: dict[str, str]) -> str:
+    host = _parse_host_from_url(source_url)
+    if not host or not mapping:
+        return ""
+    normalized = host.lower()
+    if normalized in mapping:
+        return str(mapping.get(normalized) or "")
+    for domain, value in mapping.items():
+        safe_domain = str(domain or "").strip().lower()
+        if not safe_domain:
+            continue
+        if normalized == safe_domain or normalized.endswith(f".{safe_domain}"):
+            return str(value or "")
+    return ""
+
+
+def _resolve_site_cookie_map() -> dict[str, str]:
+    raw = str(os.getenv("YT_DLP_SITE_COOKIE_MAP_JSON", "")).strip()
+    if not raw:
+        return {}
+    try:
+        payload = json.loads(raw)
+    except Exception:
+        print("[DEBUG] invalid YT_DLP_SITE_COOKIE_MAP_JSON")
+        return {}
+    if not isinstance(payload, dict):
+        print("[DEBUG] invalid YT_DLP_SITE_COOKIE_MAP_JSON payload type")
+        return {}
+    normalized: dict[str, str] = {}
+    for key, value in payload.items():
+        domain = str(key or "").strip().lower()
+        if not domain:
+            continue
+        cookie = _sanitize_cookie_header(str(value or ""))
+        if not cookie:
+            continue
+        normalized[domain] = cookie
+    return normalized
+
+
+def _resolve_site_cookie_header(source_url: str) -> str:
+    mapped = _match_domain_mapped_value(source_url=source_url, mapping=_resolve_site_cookie_map())
+    if not mapped:
+        return ""
+    return _sanitize_cookie_header(mapped)
+
+
+def _resolve_site_header_map() -> dict[str, dict[str, str]]:
+    raw = str(os.getenv("YT_DLP_SITE_HEADER_MAP_JSON", "")).strip()
+    if not raw:
+        return {}
+    try:
+        payload = json.loads(raw)
+    except Exception:
+        print("[DEBUG] invalid YT_DLP_SITE_HEADER_MAP_JSON")
+        return {}
+    if not isinstance(payload, dict):
+        print("[DEBUG] invalid YT_DLP_SITE_HEADER_MAP_JSON payload type")
+        return {}
+
+    normalized: dict[str, dict[str, str]] = {}
+    for key, value in payload.items():
+        domain = str(key or "").strip().lower()
+        if not domain or not isinstance(value, dict):
+            continue
+        headers: dict[str, str] = {}
+        for header_key, header_value in value.items():
+            safe_key = str(header_key or "").strip()
+            safe_value = str(header_value or "").strip()
+            if not safe_key or not safe_value:
+                continue
+            headers[safe_key] = safe_value
+        if headers:
+            normalized[domain] = headers
+    return normalized
+
+
+def _resolve_site_extra_headers(source_url: str) -> dict[str, str]:
+    host = _parse_host_from_url(source_url)
+    if not host:
+        return {}
+    mapping = _resolve_site_header_map()
+    if host in mapping:
+        return dict(mapping[host])
+    for domain, headers in mapping.items():
+        safe_domain = str(domain or "").strip().lower()
+        if not safe_domain:
+            continue
+        if host == safe_domain or host.endswith(f".{safe_domain}"):
+            return dict(headers)
+    return {}
+
+
 def _resolve_bilibili_cookie_header() -> str:
     raw_cookie = str(os.getenv("YT_DLP_BILIBILI_COOKIE", "")).strip()
     if not raw_cookie:
         return ""
-    sanitized = re.sub(r"[\r\n]+", " ", raw_cookie).strip()
-    if sanitized.lower().startswith("cookie:"):
-        sanitized = sanitized.split(":", 1)[1].strip()
-    return sanitized
+    return _sanitize_cookie_header(raw_cookie)
+
+
+def _resolve_yt_dlp_extra_args() -> list[str]:
+    raw = str(os.getenv("YT_DLP_EXTRA_ARGS", "")).strip()
+    if not raw:
+        return []
+    try:
+        return [item for item in shlex.split(raw, posix=(os.name != "nt")) if str(item or "").strip()]
+    except Exception:
+        print("[DEBUG] invalid YT_DLP_EXTRA_ARGS")
+        return []
+
+
+def _split_proxy_candidates(raw: str) -> list[str]:
+    text = str(raw or "").strip()
+    if not text:
+        return []
+
+    if text.startswith("["):
+        try:
+            payload = json.loads(text)
+        except Exception:
+            payload = None
+        if isinstance(payload, list):
+            return [str(item or "").strip() for item in payload if str(item or "").strip()]
+
+    return [item.strip() for item in re.split(r"[\r\n,]+", text) if str(item or "").strip()]
+
+
+def _resolve_proxy_pool() -> list[str]:
+    return _split_proxy_candidates(str(os.getenv("YT_DLP_PROXY_POOL", "")))
+
+
+def _is_antibot_failure(detail: str) -> bool:
+    lowered = str(detail or "").lower()
+    if not lowered:
+        return False
+    if "http error 412" in lowered or "precondition failed" in lowered:
+        return True
+    if "request is blocked by server (412)" in lowered:
+        return True
+    if "http error 429" in lowered or "too many requests" in lowered:
+        return True
+    if "captcha" in lowered or "challenge" in lowered:
+        return True
+    if "http error 403" in lowered and ("blocked" in lowered or "rate" in lowered or "forbidden" in lowered):
+        return True
+    return False
+
+
+def _should_retry_with_proxy(last_error: PipelineError) -> bool:
+    if not _resolve_proxy_pool():
+        return False
+    if last_error.code not in {"yt_dlp_command_failed", "download_output_missing"}:
+        return False
+    return _is_antibot_failure(last_error.detail)
 
 
 def _build_yt_dlp_request_args(source_url: str) -> list[str]:
@@ -632,18 +1056,29 @@ def _build_yt_dlp_request_args(source_url: str) -> list[str]:
     if user_agent:
         args.extend(["--user-agent", user_agent])
 
+    for header_name, header_value in _resolve_site_extra_headers(source_url).items():
+        args.extend(["--add-header", f"{header_name}:{header_value}"])
+
+    generic_cookie_header = _resolve_site_cookie_header(source_url)
+    default_cookie_args = _resolve_yt_dlp_cookies_args()
+
     if _is_bilibili_source_url(source_url):
         referer = str(os.getenv("YT_DLP_BILIBILI_REFERER", _DEFAULT_BILIBILI_REFERER)).strip() or _DEFAULT_BILIBILI_REFERER
         origin = str(os.getenv("YT_DLP_BILIBILI_ORIGIN", _DEFAULT_BILIBILI_ORIGIN)).strip() or _DEFAULT_BILIBILI_ORIGIN
-        bilibili_cookie_header = _resolve_bilibili_cookie_header()
+        bilibili_cookie_header = _resolve_bilibili_cookie_header() or generic_cookie_header
         args.extend(["--add-header", f"Referer:{referer}"])
         args.extend(["--add-header", f"Origin:{origin}"])
         args.extend(["--add-header", "Accept-Language:zh-CN,zh;q=0.9,en;q=0.8"])
         if bilibili_cookie_header:
-            print("[DEBUG] Bilibili cookie header enabled via YT_DLP_BILIBILI_COOKIE")
             args.extend(["--add-header", f"Cookie:{bilibili_cookie_header}"])
         else:
-            args.extend(_resolve_yt_dlp_cookies_args())
+            args.extend(default_cookie_args)
+        return args
+
+    if generic_cookie_header:
+        args.extend(["--add-header", f"Cookie:{generic_cookie_header}"])
+    else:
+        args.extend(default_cookie_args)
 
     return args
 
@@ -656,11 +1091,13 @@ def _run_download(
     should_cancel: CancelCheck | None,
     on_progress: ProgressCallback | None,
     timeout_seconds: int,
+    proxy_url: str,
 ) -> str:
     safe_timeout = max(60, int(timeout_seconds or _DOWNLOAD_TIMEOUT_SECONDS))
     marker = f"source_{int(time.time() * 1000)}"
     output_template = str((output_root / f"{marker}.%(ext)s").resolve())
     request_args = _build_yt_dlp_request_args(source_url)
+    extra_args = _resolve_yt_dlp_extra_args()
 
     args = [
         *command,
@@ -675,12 +1112,12 @@ def _run_download(
         "--output",
         output_template,
         *request_args,
-        "--",
-        source_url,
     ]
-
-    if request_args:
-        print(f"[DEBUG] yt-dlp extra request args enabled for url={source_url}")
+    if extra_args:
+        args.extend(extra_args)
+    if proxy_url:
+        args.extend(["--proxy", proxy_url])
+    args.extend(["--", source_url])
 
     try:
         process = subprocess.Popen(
@@ -758,40 +1195,34 @@ def _run_download(
 
 
 def _resolve_downloaded_media_file(*, output_root: Path, marker: str) -> Path | None:
-    candidates = []
-    for path in output_root.glob(f"{marker}.*"):
+    return _resolve_latest_media_file(search_root=output_root, recursive=False, filename_prefix=f"{marker}.")
+
+
+def _resolve_latest_media_file(*, search_root: Path, recursive: bool, filename_prefix: str = "") -> Path | None:
+    iterator = search_root.rglob("*") if recursive else search_root.glob("*")
+    candidates: list[tuple[int, float, Path]] = []
+    for path in iterator:
         if not path.is_file():
             continue
+        if filename_prefix and not path.name.startswith(filename_prefix):
+            continue
         suffix = path.suffix.lower()
-        if suffix in {
-            ".part",
-            ".ytdl",
-            ".json",
-            ".description",
-            ".jpg",
-            ".jpeg",
-            ".png",
-            ".webp",
-            ".vtt",
-            ".srt",
-            ".ass",
-            ".lrc",
-            ".txt",
-        }:
+        if suffix in _DOWNLOAD_SIDE_CAR_EXTENSIONS:
             continue
         try:
-            size = path.stat().st_size
+            stat = path.stat()
         except OSError:
-            size = 0
-        if size <= 0:
             continue
-        candidates.append(path)
+        if int(stat.st_size) <= 0:
+            continue
+        priority = 0 if suffix in _PRIMARY_MEDIA_EXTENSIONS else 1
+        candidates.append((priority, -float(stat.st_mtime), path))
 
     if not candidates:
         return None
 
-    candidates.sort(key=lambda item: item.stat().st_mtime, reverse=True)
-    return candidates[0]
+    candidates.sort(key=lambda item: (item[0], item[1]))
+    return candidates[0][2]
 
 
 def _build_failure_detail(*, stdout: str, stderr: str) -> str:
@@ -806,7 +1237,9 @@ def _build_failure_detail(*, stdout: str, stderr: str) -> str:
     lowered = text.lower()
     if ("bilibili" in lowered or "b23.tv" in lowered) and ("http error 412" in lowered or "precondition failed" in lowered):
         text = (
-            "B站风控拦截（HTTP 412）。请在后端配置 YT_DLP_COOKIES_FILE（cookies.txt）或 YT_DLP_BILIBILI_COOKIE（Cookie 字符串）后重试。"
+            "B站风控拦截（HTTP 412）。系统已尝试代理重试与 yutto 兜底；"
+            "请配置 YT_DLP_BILIBILI_COOKIE 或 YT_DLP_SITE_COOKIE_MAP_JSON，"
+            "并确认 YT_DLP_COOKIES_FILE/YT_DLP_PROXY_POOL 可用后重试。"
             f" 原始错误: {text}"
         )
 
