@@ -5,7 +5,6 @@ import {
   type HistoryRecordsSyncResponse,
   type JobCreateResponse,
   type JobStatusResponse,
-  type SubtitleConfigTestResponse,
   type SubtitleJobFromUrlRequest,
   type SubtitleJobOptionsPayload,
   type SubtitleJobResult,
@@ -19,24 +18,6 @@ export async function fetchHealth() {
 
 export async function fetchWhisperLocalModels() {
   return requestJson<WhisperLocalModelsResponse>('/whisper/local-models', { retry: 0 });
-}
-
-export async function testSubtitleConfig(
-  options: SubtitleJobOptionsPayload,
-  kind: 'all' | 'llm' | 'whisper' = 'all',
-  requestOptions?: { signal?: AbortSignal }
-) {
-  const endpointMap: Record<typeof kind, string> = {
-    all: '/subtitle-config/test',
-    llm: '/subtitle-config/test-llm',
-    whisper: '/subtitle-config/test-whisper'
-  };
-  return requestJson<SubtitleConfigTestResponse>(endpointMap[kind], {
-    method: 'POST',
-    body: options,
-    signal: requestOptions?.signal,
-    retry: 0
-  });
 }
 
 export async function createSubtitleJobFromFile(videoFile: File, options: SubtitleJobOptionsPayload) {

@@ -1105,27 +1105,15 @@ def test_subtitle_config(
     payload: SubtitleJobOptions,
     principal: AuthPrincipal = Depends(_require_principal),
 ) -> SubtitleConfigTestResponse:
-    payload = _inject_subtitle_options_from_principal(payload=payload, principal=principal)
-    llm_result, llm_usage = _normalize_llm_probe_output(_test_llm_config(payload))
-    whisper_result = _test_whisper_config(payload)
-    if llm_result.ok and whisper_result.ok:
-        status = "ok"
-    elif llm_result.ok or whisper_result.ok:
-        status = "partial"
-    else:
-        status = "failed"
-    if llm_result.ok:
-        try:
-            _append_llm_cost_for_scene(
-                scene="subtitle_config_probe",
-                owner_id=f"probe_{uuid.uuid4().hex[:12]}",
-                base_url=payload.llm.base_url,
-                model=payload.llm.model,
-                usage=llm_usage,
-            )
-        except Exception as exc:
-            print(f"[DEBUG] Failed to append llm probe cost ledger: {exc}")
-    return SubtitleConfigTestResponse(status=status, llm=llm_result, whisper=whisper_result)
+    _ = payload
+    _ = principal
+    raise HTTPException(
+        status_code=410,
+        detail={
+            "code": "subtitle_config_probe_removed",
+            "message": "字幕配置连通性测试接口已下线，请直接提交任务执行。",
+        },
+    )
 
 
 @app.post("/api/v1/subtitle-config/test-llm", response_model=SubtitleConfigTestResponse)
@@ -1133,22 +1121,15 @@ def test_subtitle_config_llm(
     payload: SubtitleJobOptions,
     principal: AuthPrincipal = Depends(_require_principal),
 ) -> SubtitleConfigTestResponse:
-    payload = _inject_subtitle_options_from_principal(payload=payload, principal=principal)
-    llm_result, llm_usage = _normalize_llm_probe_output(_test_llm_config(payload))
-    whisper_placeholder = SubtitleConfigProbeResult(ok=True, message="已跳过（本次仅测试 LLM）")
-    status = "ok" if llm_result.ok else "failed"
-    if llm_result.ok:
-        try:
-            _append_llm_cost_for_scene(
-                scene="subtitle_config_probe",
-                owner_id=f"probe_{uuid.uuid4().hex[:12]}",
-                base_url=payload.llm.base_url,
-                model=payload.llm.model,
-                usage=llm_usage,
-            )
-        except Exception as exc:
-            print(f"[DEBUG] Failed to append llm probe cost ledger: {exc}")
-    return SubtitleConfigTestResponse(status=status, llm=llm_result, whisper=whisper_placeholder)
+    _ = payload
+    _ = principal
+    raise HTTPException(
+        status_code=410,
+        detail={
+            "code": "subtitle_config_probe_removed",
+            "message": "字幕配置连通性测试接口已下线，请直接提交任务执行。",
+        },
+    )
 
 
 @app.post("/api/v1/subtitle-config/test-whisper", response_model=SubtitleConfigTestResponse)
@@ -1156,11 +1137,15 @@ def test_subtitle_config_whisper(
     payload: SubtitleJobOptions,
     principal: AuthPrincipal = Depends(_require_principal),
 ) -> SubtitleConfigTestResponse:
-    payload = _inject_subtitle_options_from_principal(payload=payload, principal=principal)
-    whisper_result = _test_whisper_config(payload)
-    llm_placeholder = SubtitleConfigProbeResult(ok=True, message="已跳过（本次仅测试 Whisper）")
-    status = "ok" if whisper_result.ok else "failed"
-    return SubtitleConfigTestResponse(status=status, llm=llm_placeholder, whisper=whisper_result)
+    _ = payload
+    _ = principal
+    raise HTTPException(
+        status_code=410,
+        detail={
+            "code": "subtitle_config_probe_removed",
+            "message": "字幕配置连通性测试接口已下线，请直接提交任务执行。",
+        },
+    )
 
 
 @app.post("/api/v1/browser-errors", response_model=BrowserErrorReportResponse)

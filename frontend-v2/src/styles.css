@@ -695,7 +695,6 @@ a {
   flex-wrap: wrap;
 }
 
-.upload-whisper-probe-row,
 .upload-profile-link-row {
   display: flex;
   align-items: center;
@@ -1782,43 +1781,6 @@ body.listening-immersive-active .page-listening-practice.is-immersive .practice-
   padding: 0.65rem 0.8rem;
   display: grid;
   gap: 0.4rem;
-}
-
-.probe-dot {
-  width: 10px;
-  height: 10px;
-  border-radius: 999px;
-  flex: 0 0 10px;
-  background: hsl(0 0% 46%);
-}
-
-.probe-idle {
-  background: hsl(0 0% 46%);
-}
-
-.probe-testing {
-  background: hsl(40 92% 56%);
-  animation: probe-pulse 1s ease-in-out infinite;
-}
-
-.probe-ok {
-  background: hsl(142 72% 42%);
-}
-
-.probe-failed {
-  background: hsl(0 78% 56%);
-}
-
-@keyframes probe-pulse {
-  0%,
-  100% {
-    opacity: 0.45;
-    transform: scale(0.9);
-  }
-  50% {
-    opacity: 1;
-    transform: scale(1);
-  }
 }
 
 .page-wallet {

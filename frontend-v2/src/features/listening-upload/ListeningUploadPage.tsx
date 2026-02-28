@@ -3,7 +3,6 @@ import {
   ClipboardPaste,
   Copy,
   Eraser,
-  FlaskConical,
   Upload,
   XCircle
 } from 'lucide-react';
@@ -49,8 +48,7 @@ import {
   fetchSubtitleJobStatus,
   fetchSubtitleJobVideoBlob,
   fetchWhisperLocalModels,
-  syncHistoryRecords,
-  testSubtitleConfig
+  syncHistoryRecords
 } from '../../lib/api/subtitle';
 import { ApiRequestError } from '../../lib/api/http';
 import {
@@ -117,12 +115,7 @@ const withCurrentValueOption = (
 };
 const TERMINAL_JOB_STATUSES = new Set(['completed', 'failed', 'cancelled']);
 
-type TaskActionKey = 'whisper_test' | 'submit' | 'cancel' | null;
-
-type ProbeState = {
-  status: 'idle' | 'testing' | 'ok' | 'failed';
-  message: string;
-};
+type TaskActionKey = 'submit' | 'cancel' | null;
 
 const STAGE_LABELS: Record<string, string> = {
   queued: '排队',
@@ -211,15 +204,6 @@ const getErrorMessage = (error: unknown, fallback = '请求失败') => {
   }
   if (error instanceof Error) return error.message || fallback;
   return fallback;
-};
-
-const buildProbeFailureText = (message: string, detail?: string | null) => {
-  const safeMessage = String(message || '').trim();
-  const safeDetail = String(detail || '').trim();
-  if (!safeMessage && !safeDetail) return '配置测试失败';
-  if (!safeDetail) return safeMessage || '配置测试失败';
-  if (!safeMessage) return safeDetail;
-  return `${safeMessage}（${safeDetail}）`;
 };
 
 const getSubmitValidationError = (sourceMode: SourceMode, videoFile: File | null, sourceUrl: string, options: SubtitleOptionForm) => {
@@ -372,7 +356,6 @@ export function ListeningUploadPage() {
   const [status, setStatus] = useState<JobStatusResponse | null>(null);
   const [result, setResult] = useState<SubtitleJobResult | null>(null);
   const [localModels, setLocalModels] = useState<string[]>([]);
-  const [whisperProbe, setWhisperProbe] = useState<ProbeState>({ status: 'idle', message: '待检测' });
   const [errorText, setErrorText] = useState('');
   const [historyRecords, setHistoryRecords] = useState<HistoryRecord[]>(() => initialHistoryRecordsRef.current);
   const [editingHistoryKey, setEditingHistoryKey] = useState('');
@@ -399,8 +382,6 @@ export function ListeningUploadPage() {
   const jobHistoryKeyMapRef = useRef<Record<string, string>>({});
   const jobSourceModeMapRef = useRef<Record<string, SubtitleTaskMeta['source_mode']>>({});
   const historyVideoFileMapRef = useRef<Record<string, File>>({});
-  const whisperProbeControllerRef = useRef<AbortController | null>(null);
-  const whisperProbeSequenceRef = useRef(0);
 
   const profileListeningLlm = useMemo(() => selectLlmOptions(profile, 'listening'), [profile]);
   const subtitleOptions = useMemo(
@@ -411,14 +392,6 @@ export function ListeningUploadPage() {
   const canSubmit = !actionBusy && (sourceMode === 'url' ? sourceUrl.trim().length > 0 : Boolean(videoFile));
   const canCancel = !actionBusy && Boolean(status?.job_id) && ['queued', 'running'].includes(String(status?.status || ''));
   const pendingDeleteHistoryName = String(pendingDeleteHistory?.displayName || pendingDeleteHistory?.videoName || '该历史').trim() || '该历史';
-  const canAutoProbeWhisper = useMemo(() => {
-    const runtime = String(options.whisperRuntime || '').trim().toLowerCase();
-    const model = String(options.whisperModel || '').trim();
-    if (runtime === 'local') {
-      return Boolean(model);
-    }
-    return Boolean(model);
-  }, [options.whisperModel, options.whisperRuntime]);
   const upgradeSourceState = useMemo<HistoryUpgradeSourceState>(() => {
     if (!upgradeRecord) return 'missing';
     if (upgradeSourceFile || upgradeSourceUrl.trim()) return 'ready';
@@ -565,7 +538,6 @@ export function ListeningUploadPage() {
     () => formatEtaLabel(stageDetail?.eta_seconds ?? null),
     [stageDetail?.eta_seconds]
   );
-  const isWhisperTesting = pendingAction === 'whisper_test';
   const isSubmittingJob = pendingAction === 'submit';
   const isCancellingJob = pendingAction === 'cancel';
 
@@ -714,10 +686,6 @@ export function ListeningUploadPage() {
     return () => {
       aliveRef.current = false;
       clearPollTimer();
-      if (whisperProbeControllerRef.current) {
-        whisperProbeControllerRef.current.abort();
-        whisperProbeControllerRef.current = null;
-      }
     };
   }, [clearPollTimer]);
 
@@ -842,84 +810,6 @@ export function ListeningUploadPage() {
     setSourceUrl('');
     setErrorText('');
   };
-
-  const runWhisperProbe = useCallback(async (trigger: 'manual' | 'auto') => {
-    const probeId = whisperProbeSequenceRef.current + 1;
-    whisperProbeSequenceRef.current = probeId;
-    if (whisperProbeControllerRef.current) {
-      whisperProbeControllerRef.current.abort();
-    }
-    const controller = new AbortController();
-    whisperProbeControllerRef.current = controller;
-    if (trigger === 'manual') {
-      setPendingAction('whisper_test');
-    }
-    setWhisperProbe({ status: 'testing', message: '检测中...' });
-    try {
-      const payload = await testSubtitleConfig(subtitleOptions, 'whisper', { signal: controller.signal });
-      if (controller.signal.aborted || probeId !== whisperProbeSequenceRef.current) return;
-      if (payload?.whisper?.ok) {
-        setWhisperProbe({ status: 'ok', message: payload.whisper.message || '字幕生成可用' });
-        if (trigger === 'manual') {
-          toast.success('字幕生成检测通过');
-        }
-      } else {
-        const message = buildProbeFailureText(payload?.whisper?.message || '', payload?.whisper?.detail || '');
-        setWhisperProbe({ status: 'failed', message: message || '字幕生成不可用' });
-        if (trigger === 'manual') {
-          setErrorText(message || '字幕生成配置检测失败');
-          toast.error(message || '字幕生成配置检测失败');
-        }
-      }
-    } catch (error) {
-      if (controller.signal.aborted || probeId !== whisperProbeSequenceRef.current) return;
-      const message = getErrorMessage(error, '字幕生成配置检测失败');
-      setWhisperProbe({ status: 'failed', message });
-      if (trigger === 'manual') {
-        setErrorText(message);
-        toast.error(message);
-      }
-    } finally {
-      if (whisperProbeControllerRef.current === controller) {
-        whisperProbeControllerRef.current = null;
-      }
-      if (trigger === 'manual') {
-        setPendingAction(null);
-      }
-    }
-  }, [subtitleOptions]);
-
-  const handleWhisperTest = async () => {
-    if (busy || pendingAction) return;
-    if (!canAutoProbeWhisper) {
-      toast.warning('请先选择字幕运行方式与模型后再检测');
-      return;
-    }
-    setErrorText('');
-    await runWhisperProbe('manual');
-  };
-
-  useEffect(() => {
-    if (!canAutoProbeWhisper) {
-      if (whisperProbeControllerRef.current) {
-        whisperProbeControllerRef.current.abort();
-        whisperProbeControllerRef.current = null;
-      }
-      setWhisperProbe({ status: 'idle', message: '待检测' });
-      return;
-    }
-    const timer = window.setTimeout(() => {
-      void runWhisperProbe('auto');
-    }, 800);
-    return () => {
-      window.clearTimeout(timer);
-    };
-  }, [
-    canAutoProbeWhisper,
-    options.whisperModel,
-    options.whisperRuntime,
-    runWhisperProbe
-  ]);
 
   const handleSubmit = async () => {
     if (!canSubmit || pendingAction) return;
@@ -1708,20 +1598,6 @@ export function ListeningUploadPage() {
                 云端识别会自动使用当前账号的 OneAPI 令牌与托管通道，无需填写 URL 或 API Key。
               </TypographySmall>
             ) : null}
-            <div className="upload-whisper-probe-row">
-                <Button
-                type="button"
-                variant="secondary"
-                disabled={actionBusy || !canAutoProbeWhisper}
-                icon={isWhisperTesting ? <Spinner size="sm" /> : <FlaskConical size={16} strokeWidth={1.8} />}
-                onClick={() => void handleWhisperTest()}
-              >
-                {isWhisperTesting ? '检测中...' : '字幕生成测试'}
-              </Button>
-              <span className={`probe-dot probe-${whisperProbe.status}`} aria-label={`whisper-${whisperProbe.status}`} />
-              <TypographySmall>{whisperProbe.message}</TypographySmall>
-            </div>
-
             {options.whisperRuntime === 'local' ? (
               <div className="capabilities-grid">
                 {localModels.map((model) => <Badge key={model} tone={model.endsWith('installed') ? 'success' : 'warning'}>{model}</Badge>)}

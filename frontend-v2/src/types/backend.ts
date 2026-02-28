@@ -136,18 +136,6 @@ export interface SubtitleJobResult {
   partial_error?: string;
 }
 
-export interface SubtitleConfigProbeResult {
-  ok: boolean;
-  message: string;
-  detail?: string | null;
-}
-
-export interface SubtitleConfigTestResponse {
-  status: 'ok' | 'partial' | 'failed';
-  llm: SubtitleConfigProbeResult;
-  whisper: SubtitleConfigProbeResult;
-}
-
 export interface WhisperLocalModelStatus {
   model: string;
   installed: boolean;
