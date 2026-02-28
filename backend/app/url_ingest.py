@@ -616,6 +616,16 @@ def _resolve_yt_dlp_cookies_args() -> list[str]:
     return ["--cookies", str(cookies_file)]
 
 
+def _resolve_bilibili_cookie_header() -> str:
+    raw_cookie = str(os.getenv("YT_DLP_BILIBILI_COOKIE", "")).strip()
+    if not raw_cookie:
+        return ""
+    sanitized = re.sub(r"[\r\n]+", " ", raw_cookie).strip()
+    if sanitized.lower().startswith("cookie:"):
+        sanitized = sanitized.split(":", 1)[1].strip()
+    return sanitized
+
+
 def _build_yt_dlp_request_args(source_url: str) -> list[str]:
     args: list[str] = []
     user_agent = str(os.getenv("YT_DLP_USER_AGENT", "")).strip() or _DEFAULT_YTDLP_USER_AGENT
@@ -625,10 +635,15 @@ def _build_yt_dlp_request_args(source_url: str) -> list[str]:
     if _is_bilibili_source_url(source_url):
         referer = str(os.getenv("YT_DLP_BILIBILI_REFERER", _DEFAULT_BILIBILI_REFERER)).strip() or _DEFAULT_BILIBILI_REFERER
         origin = str(os.getenv("YT_DLP_BILIBILI_ORIGIN", _DEFAULT_BILIBILI_ORIGIN)).strip() or _DEFAULT_BILIBILI_ORIGIN
+        bilibili_cookie_header = _resolve_bilibili_cookie_header()
         args.extend(["--add-header", f"Referer:{referer}"])
         args.extend(["--add-header", f"Origin:{origin}"])
         args.extend(["--add-header", "Accept-Language:zh-CN,zh;q=0.9,en;q=0.8"])
-        args.extend(_resolve_yt_dlp_cookies_args())
+        if bilibili_cookie_header:
+            print("[DEBUG] Bilibili cookie header enabled via YT_DLP_BILIBILI_COOKIE")
+            args.extend(["--add-header", f"Cookie:{bilibili_cookie_header}"])
+        else:
+            args.extend(_resolve_yt_dlp_cookies_args())
 
     return args
 
@@ -791,7 +806,7 @@ def _build_failure_detail(*, stdout: str, stderr: str) -> str:
     lowered = text.lower()
     if ("bilibili" in lowered or "b23.tv" in lowered) and ("http error 412" in lowered or "precondition failed" in lowered):
         text = (
-            "B站风控拦截（HTTP 412）。请在后端配置 YT_DLP_COOKIES_FILE（登录后导出的 cookies.txt）再重试。"
+            "B站风控拦截（HTTP 412）。请在后端配置 YT_DLP_COOKIES_FILE（cookies.txt）或 YT_DLP_BILIBILI_COOKIE（Cookie 字符串）后重试。"
             f" 原始错误: {text}"
         )
 

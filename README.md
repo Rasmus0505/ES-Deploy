@@ -63,6 +63,7 @@ npm run dev -- --host 127.0.0.1 --port 8510 --strictPort
 - `URL_SOURCE_ALLOWED_DOMAINS`：URL 任务允许域名（默认 `youtube.com,youtu.be,bilibili.com,b23.tv`）
 - `YT_DLP_EXECUTABLE`：`yt-dlp` 可执行路径（Zeabur 建议显式配置）
 - `YT_DLP_COOKIES_FILE`：可选，`cookies.txt` 文件路径（B 站 412 风控时建议配置）
+- `YT_DLP_BILIBILI_COOKIE`：可选，直接填写 B 站 Cookie 字符串（无需上传 cookies.txt，优先于 `YT_DLP_COOKIES_FILE`）
 - `YT_DLP_USER_AGENT`：可选，下载请求 UA（默认内置 Chrome UA）
 - `YT_DLP_BILIBILI_REFERER`：可选，B 站下载 Referer（默认 `https://www.bilibili.com/`）
 - `PIP_CACHE_DIR`：建议设置为持久卷路径（如 `/data/pip-cache`），减少重复部署下载依赖时间
@@ -81,7 +82,7 @@ npm run dev -- --host 127.0.0.1 --port 8510 --strictPort
 
 若 `ffmpeg/ffprobe=false`：在 Zeabur 添加系统包 `ffmpeg`。  
 若 `ytdlp=false`：确认容器内 `yt-dlp` 可执行存在，必要时设置 `YT_DLP_EXECUTABLE`。
-若 B 站链接报 `HTTP 412 Precondition Failed`：优先配置 `YT_DLP_COOKIES_FILE`（登录后导出的 cookies.txt），再重试同一链接。
+若 B 站链接报 `HTTP 412 Precondition Failed`：优先配置 `YT_DLP_BILIBILI_COOKIE`（浏览器复制 Cookie 字符串）或 `YT_DLP_COOKIES_FILE`（登录后导出的 cookies.txt），再重试同一链接。
 
 ### 前端服务
 
