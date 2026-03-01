@@ -1,0 +1,64 @@
+﻿:root {
+  color-scheme: light;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  font-family: "PingFang SC", "Noto Sans SC", "Microsoft YaHei", sans-serif;
+  background: #f6f8fc;
+  color: #1b1f2a;
+}
+
+main {
+  max-width: 960px;
+  margin: 0 auto;
+  padding: 24px;
+}
+
+.card {
+  background: #ffffff;
+  border: 1px solid #e5e9f2;
+  border-radius: 12px;
+  padding: 16px;
+  margin-bottom: 16px;
+}
+
+.row {
+  display: flex;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+input,
+button,
+textarea,
+select {
+  padding: 10px 12px;
+  border-radius: 8px;
+  border: 1px solid #d6deee;
+  font-size: 14px;
+}
+
+button {
+  cursor: pointer;
+  background: #0f6fff;
+  color: #fff;
+  border: none;
+}
+
+button.secondary {
+  background: #e8eefc;
+  color: #0f3d99;
+}
+
+pre {
+  background: #10131a;
+  color: #dbe8ff;
+  padding: 12px;
+  border-radius: 10px;
+  overflow: auto;
+}

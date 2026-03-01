@@ -1,0 +1,11 @@
+﻿celery==5.5.3
+redis==6.4.0
+sqlalchemy==2.0.43
+psycopg[binary]==3.2.9
+pydantic==2.11.7
+pydantic-settings==2.10.1
+openai==1.107.2
+requests==2.32.5
+oss2==2.19.1
+yt-dlp==2026.2.21
+prometheus-client==0.23.1
