@@ -9,8 +9,9 @@
   "scripts": {
     "predeploy:check": "node scripts/predeploy-check.mjs --strict-env",
     "dev": "vite",
-    "build:zeabur": "npm run predeploy:check && npm run build",
-    "build": "tsc -b && vite build",
+    "build:core": "tsc -b && vite build",
+    "build": "node scripts/ensure-build-deps.mjs && npm run build:core",
+    "build:zeabur": "node scripts/ensure-build-deps.mjs && npm run predeploy:check && npm run build:core",
     "preview": "vite preview"
   },
   "dependencies": {
