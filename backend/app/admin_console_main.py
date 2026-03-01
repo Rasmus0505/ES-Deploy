@@ -453,6 +453,25 @@ async def admin_update_runtime_config(request: Request) -> dict[str, Any]:
     return payload
 
 
+@app.post("/api/v1/admin/asr/test")
+async def admin_test_asr_connectivity(request: Request) -> dict[str, Any]:
+    session = _require_admin_session(request)
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    safe_body = body if isinstance(body, dict) else {}
+    if not str(safe_body.get("oneapi_token") or "").strip():
+        safe_body["oneapi_token"] = session.oneapi_access_token
+    payload = _call_user_backend(
+        "POST",
+        "/internal/asr-admin/test-connectivity",
+        json_body=safe_body,
+        actor=session.username,
+    )
+    return payload
+
+
 @app.get("/api/v1/admin/asr/users")
 def admin_list_asr_users(
     request: Request,
@@ -841,9 +860,48 @@ _ADMIN_CONSOLE_HTML = """
             <input id="cfgKeyStatus" disabled>
           </div>
         </div>
+        <div class="row-2">
+          <div>
+            <label for="cfgDashscopeApiKey">DashScope API Key（留空则不修改）</label>
+            <input id="cfgDashscopeApiKey" type="password" autocomplete="off" placeholder="sk-...">
+          </div>
+          <div>
+            <label>密钥来源</label>
+            <input id="cfgKeySourceHint" disabled>
+          </div>
+        </div>
         <button id="saveConfigBtn">保存配置</button>
         <button id="reloadConfigBtn" class="secondary">刷新配置</button>
+        <button id="clearKeyBtn" class="danger">清空后台密钥</button>
         <div id="cfgError" class="error"></div>
+      </div>
+
+      <div class="card">
+        <h2>ASR 连通测试</h2>
+        <p>默认按当前路由配置测试；若路由为 oneapi_fallback，可填 OneAPI Token 覆盖自动令牌。</p>
+        <div class="row">
+          <div>
+            <label for="testModel">测试模型</label>
+            <select id="testModel">
+              <option value="paraformer-v2">paraformer-v2</option>
+              <option value="qwen3-asr-flash-filetrans">qwen3-asr-flash-filetrans</option>
+            </select>
+          </div>
+          <div>
+            <label for="testLanguage">语言</label>
+            <input id="testLanguage" value="en">
+          </div>
+          <div>
+            <label for="testOneapiToken">OneAPI Token（可选）</label>
+            <input id="testOneapiToken" type="password" autocomplete="off" placeholder="sk-...">
+          </div>
+          <div>
+            <label>操作</label>
+            <button id="runTestBtn">一键测试</button>
+          </div>
+        </div>
+        <textarea id="testResult" rows="6" readonly style="width:100%;margin-top:8px"></textarea>
+        <div id="testError" class="error"></div>
       </div>
 
       <div class="card">
@@ -962,6 +1020,8 @@ _ADMIN_CONSOLE_HTML = """
         byId('cfgMulParaformer').value = Number(multipliers['paraformer-v2'] ?? cfg.global_multiplier ?? 0);
         byId('cfgMulQwen').value = Number(multipliers['qwen3-asr-flash-filetrans'] ?? cfg.global_multiplier ?? 0);
         byId('cfgKeyStatus').value = cfg.api_key_configured ? `已配置 (${cfg.api_key_masked || '***'})` : '未配置';
+        byId('cfgKeySourceHint').value = cfg.api_key_source || 'none';
+        byId('cfgDashscopeApiKey').value = '';
       } catch (err) {
         setError('cfgError', err.message || '读取配置失败');
       }
@@ -985,10 +1045,54 @@ _ADMIN_CONSOLE_HTML = """
           },
           note: byId('cfgNote').value.trim()
         };
+        const dashscopeApiKey = byId('cfgDashscopeApiKey').value.trim();
+        if (dashscopeApiKey) {
+          body.dashscope_api_key = dashscopeApiKey;
+        }
         await api('/api/v1/admin/runtime-config', { method: 'PUT', body: JSON.stringify(body) });
         await loadConfig();
       } catch (err) {
         setError('cfgError', err.message || '保存配置失败');
+      }
+    }
+
+    async function clearDashscopeApiKey() {
+      setError('cfgError', '');
+      try {
+        await api('/api/v1/admin/runtime-config', {
+          method: 'PUT',
+          body: JSON.stringify({
+            clear_dashscope_api_key: true,
+            note: 'admin_clear_dashscope_key'
+          })
+        });
+        byId('cfgDashscopeApiKey').value = '';
+        await loadConfig();
+      } catch (err) {
+        setError('cfgError', err.message || '清空密钥失败');
+      }
+    }
+
+    async function runAsrTest() {
+      setError('testError', '');
+      byId('testResult').value = '测试中...';
+      try {
+        const body = {
+          model: byId('testModel').value,
+          language: byId('testLanguage').value.trim() || 'en'
+        };
+        const oneapiToken = byId('testOneapiToken').value.trim();
+        if (oneapiToken) {
+          body.oneapi_token = oneapiToken;
+        }
+        const payload = await api('/api/v1/admin/asr/test', {
+          method: 'POST',
+          body: JSON.stringify(body)
+        });
+        byId('testResult').value = JSON.stringify(payload, null, 2);
+      } catch (err) {
+        byId('testResult').value = '';
+        setError('testError', err.message || 'ASR 连通测试失败');
       }
     }
 
@@ -1092,6 +1196,8 @@ _ADMIN_CONSOLE_HTML = """
     byId('logoutBtn').addEventListener('click', logout);
     byId('reloadConfigBtn').addEventListener('click', loadConfig);
     byId('saveConfigBtn').addEventListener('click', saveConfig);
+    byId('clearKeyBtn').addEventListener('click', clearDashscopeApiKey);
+    byId('runTestBtn').addEventListener('click', runAsrTest);
     byId('reloadUsersBtn').addEventListener('click', loadUsers);
     byId('reloadChargesBtn').addEventListener('click', loadCharges);
   </script>

@@ -14,7 +14,8 @@ export const LOCAL_WHISPER_MODEL_OPTIONS: ReadonlyArray<ProviderOption> = [
 
 export const CLOUD_WHISPER_MODEL_OPTIONS: ReadonlyArray<ProviderOption> = [
   { value: 'paraformer-v2', label: 'paraformer-v2（云端默认）' },
-  { value: 'qwen3-asr-flash-filetrans', label: 'qwen3-asr-flash-filetrans（长音频）' }
+  { value: 'qwen3-asr-flash', label: 'qwen3-asr-flash（推荐）' },
+  { value: 'qwen3-asr-flash-filetrans', label: 'qwen3-asr-flash-filetrans（兼容）' }
 ];
 
 export const LANGUAGE_OPTIONS: ReadonlyArray<ProviderOption> = [

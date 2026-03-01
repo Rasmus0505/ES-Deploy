@@ -7,6 +7,8 @@ import threading
 from pathlib import Path
 from typing import Any
 
+from app.security_crypto import decrypt_secret, encrypt_secret, mask_secret
+
 
 def _now_ms() -> int:
     from time import time
@@ -127,6 +129,7 @@ class AsrRuntimeConfigStore:
                         id INTEGER PRIMARY KEY CHECK(id = 1),
                         route_mode TEXT NOT NULL DEFAULT 'oneapi_fallback',
                         dashscope_base_url TEXT NOT NULL DEFAULT '',
+                        dashscope_api_key_ciphertext TEXT NOT NULL DEFAULT '',
                         global_multiplier REAL NOT NULL DEFAULT 0,
                         model_multipliers_json TEXT NOT NULL DEFAULT '{}',
                         model_enabled_json TEXT NOT NULL DEFAULT '{}',
@@ -147,6 +150,7 @@ class AsrRuntimeConfigStore:
                             id,
                             route_mode,
                             dashscope_base_url,
+                            dashscope_api_key_ciphertext,
                             global_multiplier,
                             model_multipliers_json,
                             model_enabled_json,
@@ -154,11 +158,12 @@ class AsrRuntimeConfigStore:
                             updated_by,
                             note,
                             updated_at
-                        ) VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        ) VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
                         (
                             self._default_route_mode,
                             self._default_dashscope_base_url,
+                            "",
                             self._default_global_multiplier,
                             "{}",
                             json.dumps(self._default_model_enabled, ensure_ascii=False),
@@ -168,12 +173,24 @@ class AsrRuntimeConfigStore:
                             _now_ms(),
                         ),
                     )
+                columns = {
+                    str(item["name"] or "").strip().lower()
+                    for item in connection.execute(
+                        "PRAGMA table_info(subtitle_asr_runtime_config)"
+                    ).fetchall()
+                    if str(item["name"] or "").strip()
+                }
+                if "dashscope_api_key_ciphertext" not in columns:
+                    connection.execute(
+                        "ALTER TABLE subtitle_asr_runtime_config ADD COLUMN dashscope_api_key_ciphertext TEXT NOT NULL DEFAULT ''"
+                    )
                 connection.commit()
 
     def _defaults_payload(self) -> dict[str, Any]:
         return {
             "route_mode": self._default_route_mode,
             "dashscope_base_url": self._default_dashscope_base_url,
+            "dashscope_api_key_ciphertext": "",
             "global_multiplier": self._default_global_multiplier,
             "model_multipliers": {},
             "model_enabled": dict(self._default_model_enabled),
@@ -191,7 +208,12 @@ class AsrRuntimeConfigStore:
             return {}
         return payload if isinstance(payload, dict) else {}
 
-    def _normalize_payload(self, payload: dict[str, Any]) -> dict[str, Any]:
+    def _normalize_payload(
+        self,
+        payload: dict[str, Any],
+        *,
+        include_secret: bool = False,
+    ) -> dict[str, Any]:
         defaults = self._defaults_payload()
         route_mode = _normalize_route_mode(
             payload.get("route_mode"),
@@ -215,9 +237,17 @@ class AsrRuntimeConfigStore:
             payload.get("submit_min_remaining_quota"),
             fallback=int(defaults["submit_min_remaining_quota"]),
         )
-        return {
+        dashscope_api_key_ciphertext = str(
+            payload.get("dashscope_api_key_ciphertext")
+            or defaults["dashscope_api_key_ciphertext"]
+        ).strip()
+        dashscope_api_key = decrypt_secret(dashscope_api_key_ciphertext)
+        normalized = {
             "route_mode": route_mode,
             "dashscope_base_url": dashscope_base_url,
+            "dashscope_api_key_ciphertext": dashscope_api_key_ciphertext,
+            "dashscope_api_key_configured": bool(dashscope_api_key),
+            "dashscope_api_key_masked": mask_secret(dashscope_api_key),
             "global_multiplier": global_multiplier,
             "model_multipliers": model_multipliers,
             "model_enabled": model_enabled,
@@ -226,8 +256,11 @@ class AsrRuntimeConfigStore:
             "note": str(payload.get("note") or "").strip(),
             "updated_at": max(0, int(payload.get("updated_at") or 0)),
         }
+        if include_secret:
+            normalized["dashscope_api_key"] = dashscope_api_key
+        return normalized
 
-    def get_config(self) -> dict[str, Any]:
+    def get_config(self, *, include_secret: bool = False) -> dict[str, Any]:
         with self._lock:
             with self._connect() as connection:
                 row = connection.execute(
@@ -235,6 +268,7 @@ class AsrRuntimeConfigStore:
                     SELECT
                         route_mode,
                         dashscope_base_url,
+                        dashscope_api_key_ciphertext,
                         global_multiplier,
                         model_multipliers_json,
                         model_enabled_json,
@@ -248,10 +282,14 @@ class AsrRuntimeConfigStore:
                     """
                 ).fetchone()
         if row is None:
-            return self._defaults_payload()
+            return self._normalize_payload(
+                self._defaults_payload(),
+                include_secret=include_secret,
+            )
         raw_payload = {
             "route_mode": row["route_mode"],
             "dashscope_base_url": row["dashscope_base_url"],
+            "dashscope_api_key_ciphertext": row["dashscope_api_key_ciphertext"],
             "global_multiplier": row["global_multiplier"],
             "model_multipliers": self._json_loads_dict(row["model_multipliers_json"]),
             "model_enabled": self._json_loads_dict(row["model_enabled_json"]),
@@ -260,7 +298,7 @@ class AsrRuntimeConfigStore:
             "note": row["note"],
             "updated_at": row["updated_at"],
         }
-        return self._normalize_payload(raw_payload)
+        return self._normalize_payload(raw_payload, include_secret=include_secret)
 
     def update_config(
         self,
@@ -269,19 +307,32 @@ class AsrRuntimeConfigStore:
         updated_by: str,
         note: str = "",
     ) -> dict[str, Any]:
-        safe_patch = patch if isinstance(patch, dict) else {}
+        safe_patch: dict[str, Any] = dict(patch) if isinstance(patch, dict) else {}
         with self._lock:
-            current = self.get_config()
+            current = self.get_config(include_secret=True)
+            current_ciphertext = str(current.get("dashscope_api_key_ciphertext") or "")
+            if "dashscope_api_key" in safe_patch:
+                dashscope_api_key = str(
+                    safe_patch.get("dashscope_api_key") or ""
+                ).strip()
+                resolved_ciphertext = (
+                    encrypt_secret(dashscope_api_key) if dashscope_api_key else ""
+                )
+            elif bool(safe_patch.get("clear_dashscope_api_key")):
+                resolved_ciphertext = ""
+            else:
+                resolved_ciphertext = current_ciphertext
             merged = {
                 **current,
                 **safe_patch,
+                "dashscope_api_key_ciphertext": resolved_ciphertext,
                 "updated_by": str(updated_by or "").strip()
                 or current.get("updated_by")
                 or "admin",
                 "note": str(note or safe_patch.get("note") or "").strip(),
                 "updated_at": _now_ms(),
             }
-            normalized = self._normalize_payload(merged)
+            normalized = self._normalize_payload(merged, include_secret=True)
             with self._connect() as connection:
                 connection.execute(
                     """
@@ -289,6 +340,7 @@ class AsrRuntimeConfigStore:
                     SET
                         route_mode=?,
                         dashscope_base_url=?,
+                        dashscope_api_key_ciphertext=?,
                         global_multiplier=?,
                         model_multipliers_json=?,
                         model_enabled_json=?,
@@ -301,6 +353,7 @@ class AsrRuntimeConfigStore:
                     (
                         normalized["route_mode"],
                         normalized["dashscope_base_url"],
+                        str(normalized["dashscope_api_key_ciphertext"] or ""),
                         float(normalized["global_multiplier"]),
                         json.dumps(normalized["model_multipliers"], ensure_ascii=False),
                         json.dumps(normalized["model_enabled"], ensure_ascii=False),
@@ -311,15 +364,18 @@ class AsrRuntimeConfigStore:
                     ),
                 )
                 connection.commit()
-        return normalized
+        return self._normalize_payload(normalized, include_secret=False)
+
+    def get_dashscope_api_key(self) -> str:
+        config = self.get_config(include_secret=True)
+        return str(config.get("dashscope_api_key") or "").strip()
 
     def resolve_multiplier(self, *, model: str) -> float:
         config = self.get_config()
         model_key = str(model or "").strip().lower()
-        model_multipliers = (
-            config.get("model_multipliers")
-            if isinstance(config.get("model_multipliers"), dict)
-            else {}
+        raw_model_multipliers = config.get("model_multipliers")
+        model_multipliers: dict[str, Any] = (
+            raw_model_multipliers if isinstance(raw_model_multipliers, dict) else {}
         )
         if model_key and model_key in model_multipliers:
             value = _safe_non_negative_float(
@@ -332,10 +388,9 @@ class AsrRuntimeConfigStore:
     def is_model_enabled(self, *, model: str) -> bool:
         config = self.get_config()
         model_key = str(model or "").strip().lower()
-        model_enabled = (
-            config.get("model_enabled")
-            if isinstance(config.get("model_enabled"), dict)
-            else {}
+        raw_model_enabled = config.get("model_enabled")
+        model_enabled: dict[str, Any] = (
+            raw_model_enabled if isinstance(raw_model_enabled, dict) else {}
         )
         if not model_key:
             return True

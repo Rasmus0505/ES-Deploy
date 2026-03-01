@@ -160,12 +160,12 @@ DASHSCOPE_ASR_BASE_URL = _normalize_whisper_base_url(
         )
     )
 )
-DASHSCOPE_ASR_API_KEY = str(os.getenv("DASHSCOPE_API_KEY", "")).strip()
+DASHSCOPE_ASR_API_KEY_FALLBACK = str(os.getenv("DASHSCOPE_API_KEY", "")).strip()
 ASR_SUBMIT_MIN_REMAINING_QUOTA = max(
     1, int(float(os.getenv("ASR_SUBMIT_MIN_REMAINING_QUOTA", "1") or 1))
 )
 DEFAULT_ASR_ROUTE_MODE = (
-    "dashscope_direct" if DASHSCOPE_ASR_API_KEY else "oneapi_fallback"
+    "dashscope_direct" if DASHSCOPE_ASR_API_KEY_FALLBACK else "oneapi_fallback"
 )
 ASR_ADMIN_SERVICE_TOKEN = str(os.getenv("ASR_ADMIN_SERVICE_TOKEN", "")).strip()
 DEFAULT_WALLET_PACKS = [
@@ -280,28 +280,29 @@ def _build_oneapi_user_whisper_payload(
     model = str(safe.get("model") or "").strip() or default_model
     language = str(safe.get("language") or "").strip() or "en"
     if runtime == "cloud":
-        runtime_config = _resolve_asr_runtime_config()
+        runtime_config = _resolve_asr_runtime_config(include_secret=True)
         route_mode = str(
             runtime_config.get("route_mode") or DEFAULT_ASR_ROUTE_MODE
         ).strip()
         dashscope_base_url = _normalize_whisper_base_url(
             str(runtime_config.get("dashscope_base_url") or DASHSCOPE_ASR_BASE_URL)
         )
-        if route_mode == "dashscope_direct" and DASHSCOPE_ASR_API_KEY:
+        dashscope_api_key, key_source = _resolve_dashscope_api_key()
+        if route_mode == "dashscope_direct" and dashscope_api_key:
             print(
                 "[DEBUG] ASR route selected: direct_dashscope "
-                f"model={model} base_url={dashscope_base_url}"
+                f"model={model} base_url={dashscope_base_url} key_source={key_source}"
             )
             return {
                 "runtime": "cloud",
                 "model": model,
                 "language": language,
                 "base_url": dashscope_base_url,
-                "api_key": DASHSCOPE_ASR_API_KEY,
+                "api_key": dashscope_api_key,
             }
-        if route_mode == "dashscope_direct" and not DASHSCOPE_ASR_API_KEY:
+        if route_mode == "dashscope_direct" and not dashscope_api_key:
             print(
-                "[DEBUG] ASR route expected dashscope_direct but DASHSCOPE_API_KEY missing, fallback to oneapi"
+                "[DEBUG] ASR route expected dashscope_direct but no dashscope key available, fallback to oneapi"
             )
         else:
             print("[DEBUG] ASR route selected: oneapi_fallback")
@@ -376,8 +377,17 @@ asr_runtime_store = AsrRuntimeConfigStore(
 )
 
 
-def _resolve_asr_runtime_config() -> dict:
-    return asr_runtime_store.get_config()
+def _resolve_asr_runtime_config(*, include_secret: bool = False) -> dict:
+    return asr_runtime_store.get_config(include_secret=include_secret)
+
+
+def _resolve_dashscope_api_key() -> tuple[str, str]:
+    runtime_key = asr_runtime_store.get_dashscope_api_key()
+    if runtime_key:
+        return runtime_key, "runtime_config"
+    if DASHSCOPE_ASR_API_KEY_FALLBACK:
+        return DASHSCOPE_ASR_API_KEY_FALLBACK, "env"
+    return "", "none"
 
 
 def _resolve_asr_wallet_multiplier_for_model(model: str) -> float:
@@ -604,7 +614,8 @@ def _to_wallet_packs_response() -> WalletPacksResponse:
 
 
 def _public_asr_runtime_config_payload() -> dict[str, Any]:
-    config = _resolve_asr_runtime_config()
+    config = _resolve_asr_runtime_config(include_secret=True)
+    dashscope_api_key, key_source = _resolve_dashscope_api_key()
     route_mode = str(config.get("route_mode") or DEFAULT_ASR_ROUTE_MODE).strip()
     route_base_url = (
         str(config.get("dashscope_base_url") or DASHSCOPE_ASR_BASE_URL).strip()
@@ -617,8 +628,12 @@ def _public_asr_runtime_config_payload() -> dict[str, Any]:
         "dashscope_base_url": str(
             config.get("dashscope_base_url") or DASHSCOPE_ASR_BASE_URL
         ).strip(),
-        "api_key_configured": bool(DASHSCOPE_ASR_API_KEY),
-        "api_key_masked": mask_secret(DASHSCOPE_ASR_API_KEY),
+        "api_key_configured": bool(dashscope_api_key),
+        "api_key_masked": mask_secret(dashscope_api_key),
+        "api_key_source": key_source,
+        "runtime_api_key_configured": bool(
+            str(config.get("dashscope_api_key") or "").strip()
+        ),
         "global_multiplier": max(0.0, float(config.get("global_multiplier") or 0.0)),
         "model_multipliers": (
             config.get("model_multipliers")
@@ -1738,6 +1753,14 @@ async def internal_update_asr_runtime_config(request: Request) -> dict:
         safe_patch["model_multipliers"] = patch.get("model_multipliers")
     if "model_enabled" in patch and isinstance(patch.get("model_enabled"), dict):
         safe_patch["model_enabled"] = patch.get("model_enabled")
+    if "dashscope_api_key" in patch:
+        safe_patch["dashscope_api_key"] = str(
+            patch.get("dashscope_api_key") or ""
+        ).strip()
+    if "clear_dashscope_api_key" in patch:
+        safe_patch["clear_dashscope_api_key"] = bool(
+            patch.get("clear_dashscope_api_key")
+        )
 
     updated_by = (
         str(request.headers.get("x-asr-admin-actor") or "").strip()
@@ -1757,6 +1780,65 @@ async def internal_update_asr_runtime_config(request: Request) -> dict:
     return {
         "status": "ok",
         "config": _public_asr_runtime_config_payload(),
+    }
+
+
+@app.post("/api/v1/internal/asr-admin/test-connectivity")
+async def internal_test_asr_connectivity(request: Request) -> dict:
+    _require_internal_asr_admin_service(request)
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    safe_body = body if isinstance(body, dict) else {}
+    requested_model = str(safe_body.get("model") or "paraformer-v2").strip().lower()
+    model = (
+        "qwen3-asr-flash-filetrans"
+        if requested_model == "qwen3-asr-flash-filetrans"
+        else "paraformer-v2"
+    )
+    language = str(safe_body.get("language") or "en").strip() or "en"
+    fallback_access_token = str(safe_body.get("oneapi_token") or "").strip()
+
+    whisper_payload = _build_oneapi_user_whisper_payload(
+        access_token=fallback_access_token,
+        raw_whisper={
+            "runtime": "cloud",
+            "model": model,
+            "language": language,
+        },
+    )
+    options = SubtitleJobOptions.model_validate(
+        {
+            "source_language": language,
+            "target_language": "zh",
+            "whisper": whisper_payload,
+        }
+    )
+    probe = _test_whisper_cloud(options)
+    base_url = str(whisper_payload.get("base_url") or "").strip()
+    route_mode = "oneapi_fallback"
+    if "dashscope.aliyuncs.com" in base_url:
+        route_mode = "dashscope_direct"
+    print(
+        "[DEBUG] Internal ASR connectivity test "
+        f"model={model} route_mode={route_mode} ok={probe.ok}"
+    )
+    return {
+        "status": "ok",
+        "probe": {
+            "ok": bool(probe.ok),
+            "message": str(probe.message or ""),
+            "detail": str(probe.detail or ""),
+        },
+        "effective": {
+            "model": model,
+            "language": language,
+            "route_mode": route_mode,
+            "base_url": base_url,
+            "api_key_configured": bool(str(whisper_payload.get("api_key") or "")),
+        },
+        "runtime_config": _public_asr_runtime_config_payload(),
     }
 
 
