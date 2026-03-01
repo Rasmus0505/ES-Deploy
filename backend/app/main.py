@@ -36,6 +36,7 @@ from app.auth_service import AuthError, AuthPrincipal, AuthService
 from app.history_store import SqliteHistoryStore
 from app.job_manager import SubtitleJobManager
 from app.llm_cost_ledger import append_llm_cost_record
+from app.oneapi_client import OneAPIClient, OneAPIClientError
 from app.provider_url_rules import (
     DEFAULT_LLM_BASE_URL,
     extract_responses_output_text as _extract_responses_output_text,
@@ -254,16 +255,66 @@ def _resolve_wallet_packs() -> list[dict]:
 WALLET_PACKS = _resolve_wallet_packs()
 
 
+def _normalize_preferred_model_for_oneapi_token(model: str) -> str:
+    safe_model = str(model or "").strip().lower()
+    if safe_model == "qwen3-asr-flash-filetrans":
+        return "qwen3-asr-flash"
+    return safe_model
+
+
+def _resolve_oneapi_v1_api_key(
+    *, access_token: str, preferred_model: str = ""
+) -> tuple[str, str]:
+    safe_access_token = str(access_token or "").strip()
+    if not safe_access_token:
+        return "", "missing_access_token"
+    safe_preferred_model = _normalize_preferred_model_for_oneapi_token(preferred_model)
+    try:
+        resolved_token = oneapi_client.resolve_v1_api_key(
+            access_token=safe_access_token,
+            preferred_model=safe_preferred_model,
+        )
+        if resolved_token:
+            masked_suffix = (
+                resolved_token[-6:] if len(resolved_token) >= 6 else resolved_token
+            )
+            print(
+                "[DEBUG] OneAPI /v1 token resolved "
+                f"preferred_model={safe_preferred_model or '-'} "
+                f"token_suffix={masked_suffix}"
+            )
+            return resolved_token, "oneapi_api_token"
+    except OneAPIClientError as exc:
+        print(
+            "[DEBUG] OneAPI /v1 token resolve failed, fallback to access token "
+            f"preferred_model={safe_preferred_model or '-'} "
+            f"code={exc.code} status={exc.status_code} message={str(exc.message)[:200]}"
+        )
+    return safe_access_token, "access_token_fallback"
+
+
 def _build_oneapi_user_llm_payload(
     *, access_token: str, raw_llm: dict | None = None
 ) -> dict:
     safe = _sanitize_llm_options_payload(raw_llm if isinstance(raw_llm, dict) else None)
+    model = (
+        str(safe.get("model") or DEFAULT_PROFILE_LLM_MODEL).strip()
+        or DEFAULT_PROFILE_LLM_MODEL
+    )
+    relay_api_key, relay_source = _resolve_oneapi_v1_api_key(
+        access_token=access_token,
+        preferred_model=model,
+    )
+    if relay_source != "oneapi_api_token":
+        print(
+            "[DEBUG] LLM /v1 call uses fallback auth token "
+            f"source={relay_source} model={model}"
+        )
     return _sanitize_llm_options_payload(
         {
             "base_url": ONEAPI_V1_BASE_URL,
-            "api_key": str(access_token or "").strip(),
-            "model": str(safe.get("model") or DEFAULT_PROFILE_LLM_MODEL).strip()
-            or DEFAULT_PROFILE_LLM_MODEL,
+            "api_key": relay_api_key,
+            "model": model,
             "llm_support_json": bool(safe.get("llm_support_json", False)),
         }
     )
@@ -306,12 +357,21 @@ def _build_oneapi_user_whisper_payload(
             )
         else:
             print("[DEBUG] ASR route selected: oneapi_fallback")
+        relay_api_key, relay_source = _resolve_oneapi_v1_api_key(
+            access_token=access_token,
+            preferred_model=model,
+        )
+        if relay_source != "oneapi_api_token":
+            print(
+                "[DEBUG] ASR oneapi_fallback uses access token fallback "
+                f"source={relay_source} model={model}"
+            )
         return {
             "runtime": "cloud",
             "model": model,
             "language": language,
             "base_url": ONEAPI_V1_BASE_URL,
-            "api_key": str(access_token or "").strip(),
+            "api_key": relay_api_key,
         }
     return {
         "runtime": "local",
@@ -368,6 +428,7 @@ history_store = SqliteHistoryStore(db_path=str(LOCAL_SQLITE_DB))
 reading_store = SqliteReadingStore(db_path=str(LOCAL_SQLITE_DB))
 profile_store = reading_store
 auth_service = AuthService()
+oneapi_client = OneAPIClient()
 asr_runtime_store = AsrRuntimeConfigStore(
     db_path=str(LOCAL_SQLITE_DB),
     default_route_mode=DEFAULT_ASR_ROUTE_MODE,
@@ -427,6 +488,7 @@ def _validate_subtitle_job_options(options: SubtitleJobOptions) -> dict:
     whisper_model_key = whisper_model.lower()
     cloud_only_models = {
         "paraformer-v2",
+        "qwen3-asr-flash",
         "qwen3-asr-flash-filetrans",
         "distil-large-v2",
         "large-v3-turbo",

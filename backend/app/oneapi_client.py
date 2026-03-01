@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
+from time import time
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
@@ -338,6 +339,166 @@ class OneAPIClient:
             "items": safe_items,
             "total": total,
         }
+
+    @staticmethod
+    def _normalize_token_models(raw: Any) -> list[str]:
+        if isinstance(raw, list):
+            values = [str(item or "").strip().lower() for item in raw]
+            return [item for item in values if item]
+        text = str(raw or "").strip()
+        if not text:
+            return []
+        values = [item.strip().lower() for item in text.split(",")]
+        return [item for item in values if item]
+
+    @staticmethod
+    def _normalize_token_item(item: Any) -> dict[str, Any] | None:
+        if not isinstance(item, dict):
+            return None
+        key = str(item.get("key") or item.get("token") or "").strip()
+        if not key:
+            return None
+        try:
+            status = int(item.get("status") or 1)
+        except Exception:
+            status = 1
+        try:
+            token_id = int(item.get("id") or 0)
+        except Exception:
+            token_id = 0
+        try:
+            expired_time = int(item.get("expired_time") or -1)
+        except Exception:
+            expired_time = -1
+        try:
+            remain_quota = int(
+                item.get("remain_quota")
+                or item.get("remaining_quota")
+                or item.get("quota")
+                or 0
+            )
+        except Exception:
+            remain_quota = 0
+        unlimited_quota = bool(
+            item.get("unlimited_quota") or item.get("unlimitedQuota") or False
+        )
+        models = OneAPIClient._normalize_token_models(item.get("models"))
+        return {
+            "id": token_id,
+            "name": str(item.get("name") or "").strip(),
+            "key": key,
+            "status": status,
+            "expired_time": expired_time,
+            "remain_quota": max(0, remain_quota),
+            "unlimited_quota": unlimited_quota,
+            "models": models,
+            "raw": item,
+        }
+
+    @staticmethod
+    def _normalize_token_list_response(payload: Any) -> list[dict[str, Any]]:
+        candidates: list[Any] = []
+        if isinstance(payload, list):
+            candidates = payload
+        elif isinstance(payload, dict):
+            for key in ("items", "list", "rows", "tokens", "data"):
+                value = payload.get(key)
+                if isinstance(value, list):
+                    candidates = value
+                    break
+        normalized: list[dict[str, Any]] = []
+        for item in candidates:
+            safe_item = OneAPIClient._normalize_token_item(item)
+            if isinstance(safe_item, dict):
+                normalized.append(safe_item)
+        return normalized
+
+    @staticmethod
+    def _pick_v1_token(
+        items: list[dict[str, Any]], *, preferred_model: str = ""
+    ) -> str:
+        safe_preferred = str(preferred_model or "").strip().lower()
+        now_seconds = int(time())
+        candidates: list[tuple[tuple[int, int, int, int], str]] = []
+
+        for item in items:
+            status = int(item.get("status") or 0)
+            if status not in {0, 1}:
+                continue
+            expired_time = int(item.get("expired_time") or -1)
+            if expired_time > 0 and expired_time <= now_seconds:
+                continue
+            unlimited_quota = bool(item.get("unlimited_quota"))
+            remain_quota = max(0, int(item.get("remain_quota") or 0))
+            if not unlimited_quota and remain_quota <= 0:
+                continue
+
+            models = item.get("models") if isinstance(item.get("models"), list) else []
+            normalized_models = {
+                str(model or "").strip().lower()
+                for model in models
+                if str(model or "").strip()
+            }
+            supports_all = len(normalized_models) == 0
+            exact_model_match = bool(
+                safe_preferred and safe_preferred in normalized_models
+            )
+            supports_preferred = supports_all or exact_model_match
+            if safe_preferred and not supports_preferred:
+                continue
+
+            token_key = str(item.get("key") or "").strip()
+            if not token_key:
+                continue
+            score = (
+                1 if exact_model_match else 0,
+                1 if supports_all else 0,
+                1 if unlimited_quota else 0,
+                remain_quota,
+            )
+            candidates.append((score, token_key))
+
+        if not candidates:
+            return ""
+        candidates.sort(reverse=True)
+        return candidates[0][1]
+
+    def resolve_v1_api_key(
+        self,
+        *,
+        access_token: str,
+        preferred_model: str = "",
+    ) -> str:
+        safe_access_token = str(access_token or "").strip()
+        if not safe_access_token:
+            raise OneAPIClientError(
+                status_code=401,
+                code="missing_access_token",
+                message="缺少 OneAPI access token",
+            )
+
+        candidate_paths: list[str] = ["/token/", "/token", "/tokens"]
+        for query in ("p=0", "page=0", "offset=0&limit=100"):
+            for base in ("/token/", "/token", "/tokens"):
+                candidate_paths.append(self._join_path_query(base, query))
+
+        payload = self._request_candidates(
+            "GET",
+            candidate_paths,
+            access_token=safe_access_token,
+        )
+        items = self._normalize_token_list_response(payload)
+        token = self._pick_v1_token(items, preferred_model=preferred_model)
+        if token:
+            return token
+
+        safe_model = str(preferred_model or "").strip()
+        suffix = f"（model={safe_model}）" if safe_model else ""
+        raise OneAPIClientError(
+            status_code=400,
+            code="oneapi_no_usable_api_token",
+            message=f"当前用户没有可用于 /v1 调用的令牌{suffix}",
+        )
 
     def admin_list_users(
         self,

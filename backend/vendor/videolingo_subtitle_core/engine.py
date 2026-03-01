@@ -3,12 +3,14 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import mimetypes
 import os
 import re
 import shutil
 import subprocess
 import threading
 import time
+import base64
 from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
@@ -156,12 +158,14 @@ _SUBTITLE_MAX_LENGTH = 75
 _SUBTITLE_TARGET_MULTIPLIER = 1.2
 _CLOUD_ASR_MODEL = "paraformer-v2"
 _CLOUD_QWEN_ASR_MODEL = "qwen3-asr-flash-filetrans"
+_CLOUD_QWEN_ASR_OPENAI_COMPAT_MODEL = "qwen3-asr-flash"
 _CLOUD_ASR_PROVIDER = "cloud_paraformer_v2"
 _CLOUD_QWEN_ASR_PROVIDER = "cloud_qwen3_asr_flash_filetrans"
 _QWEN_FALLBACK_RATIO_THRESHOLD = 0.10
 _CLOUD_ASR_MODEL_ALIASES: dict[str, str] = {
     _CLOUD_ASR_MODEL: _CLOUD_ASR_MODEL,
     _CLOUD_QWEN_ASR_MODEL: _CLOUD_QWEN_ASR_MODEL,
+    _CLOUD_QWEN_ASR_OPENAI_COMPAT_MODEL: _CLOUD_QWEN_ASR_MODEL,
 }
 _CLOUD_ASR_PROVIDER_BY_MODEL: dict[str, str] = {
     _CLOUD_ASR_MODEL: _CLOUD_ASR_PROVIDER,
@@ -471,6 +475,7 @@ def resolve_whisper_runtime_models(whisper: WhisperOptions) -> tuple[str, str, s
     if runtime == "local" and requested_model_key in {
         _CLOUD_ASR_MODEL,
         _CLOUD_QWEN_ASR_MODEL,
+        _CLOUD_QWEN_ASR_OPENAI_COMPAT_MODEL,
         "distil-large-v2",
         "large-v3-turbo",
         "whisper-large-v3-turbo",
@@ -1529,6 +1534,7 @@ _ASR_ENDPOINT_SUFFIXES = (
     "/audio/transcriptions",
     "/files/transcriptions",
 )
+_ASR_CHAT_ENDPOINT_SUFFIXES = ("/chat/completions",)
 _TRANSCRIPTION_START_TIME_KEYS: tuple[tuple[str, bool], ...] = (
     ("start", False),
     ("start_time", False),
@@ -1566,6 +1572,29 @@ def _build_asr_endpoint_candidates(base_url: str) -> list[str]:
     seen: set[str] = set()
     candidates: list[str] = []
     for suffix in _ASR_ENDPOINT_SUFFIXES:
+        endpoint = f"{base_root.rstrip('/')}{suffix}"
+        key = endpoint.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        candidates.append(endpoint)
+    if not candidates:
+        candidates.append(normalized.rstrip("/"))
+    return candidates
+
+
+def _build_asr_chat_endpoint_candidates(base_url: str) -> list[str]:
+    normalized = _normalize_base_url(base_url)
+    normalized_lower = normalized.lower()
+    base_root = normalized
+    for suffix in _ASR_CHAT_ENDPOINT_SUFFIXES:
+        if normalized_lower.endswith(suffix):
+            base_root = normalized[: -len(suffix)].rstrip("/") or normalized
+            break
+
+    seen: set[str] = set()
+    candidates: list[str] = []
+    for suffix in _ASR_CHAT_ENDPOINT_SUFFIXES:
         endpoint = f"{base_root.rstrip('/')}{suffix}"
         key = endpoint.lower()
         if key in seen:
@@ -1838,6 +1867,47 @@ def _extract_segments_from_cloud_transcription_payload(
     return None
 
 
+def _extract_text_from_chat_completion_payload(payload: dict) -> str:
+    if not isinstance(payload, dict):
+        return ""
+    choices = payload.get("choices")
+    if not isinstance(choices, list):
+        return ""
+    for item in choices:
+        if not isinstance(item, dict):
+            continue
+        message_raw = item.get("message")
+        if not isinstance(message_raw, dict):
+            continue
+        content = message_raw.get("content")
+        if isinstance(content, str):
+            text = content.strip()
+            if text:
+                return text
+            continue
+        if not isinstance(content, list):
+            continue
+        parts: list[str] = []
+        for chunk in content:
+            if isinstance(chunk, str):
+                text = chunk.strip()
+            elif isinstance(chunk, dict):
+                text = str(
+                    chunk.get("text")
+                    or chunk.get("content")
+                    or chunk.get("value")
+                    or ""
+                ).strip()
+            else:
+                text = ""
+            if text:
+                parts.append(text)
+        merged = "".join(parts).strip()
+        if merged:
+            return merged
+    return ""
+
+
 def _status_code_to_int(value: Any) -> int:
     try:
         return int(value)
@@ -2008,6 +2078,155 @@ def _transcribe_cloud_openai_compatible(
         "asr",
         "cloud_asr_failed",
         f"{model_label} 云端识别结果缺少可解析分句",
+        detail="\n".join(failure_details)[:1200],
+    )
+
+
+def _transcribe_qwen3_asr_chat_openai_compatible(
+    audio_path: str,
+    whisper: WhisperOptions,
+    *,
+    model: str,
+    model_label: str,
+) -> list[dict]:
+    api_key = (whisper.api_key or "").strip()
+    if not api_key:
+        raise PipelineError(
+            "asr",
+            "missing_whisper_api_key",
+            "whisper.runtime=cloud 时必须提供 whisper.api_key",
+        )
+
+    language = str(whisper.language or "").strip()
+    normalized_language = language.strip().lower()
+    base_url = _normalize_base_url(whisper.base_url)
+    endpoints = _build_asr_chat_endpoint_candidates(base_url)
+    failure_details: list[str] = []
+    audio_name = Path(audio_path).name or "audio.wav"
+
+    try:
+        audio_bytes = Path(audio_path).read_bytes()
+    except Exception as exc:
+        raise PipelineError(
+            "asr",
+            "cloud_asr_failed",
+            f"{model_label} 音频读取失败",
+            detail=str(exc)[:420],
+        ) from exc
+
+    guessed_mime, _ = mimetypes.guess_type(audio_name)
+    mime_type = guessed_mime or "audio/wav"
+    audio_data_uri = (
+        f"data:{mime_type};base64,{base64.b64encode(audio_bytes).decode('ascii')}"
+    )
+
+    effective_model = str(model or "").strip() or _CLOUD_QWEN_ASR_OPENAI_COMPAT_MODEL
+    if effective_model.lower() == _CLOUD_QWEN_ASR_MODEL:
+        effective_model = _CLOUD_QWEN_ASR_OPENAI_COMPAT_MODEL
+
+    request_payload: dict[str, Any] = {
+        "model": effective_model,
+        "stream": False,
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "input_audio",
+                        "input_audio": {
+                            "data": audio_data_uri,
+                        },
+                    }
+                ],
+            }
+        ],
+        "extra_body": {
+            "asr_options": {
+                "enable_itn": False,
+            }
+        },
+    }
+    if normalized_language and normalized_language not in {
+        "auto",
+        "mixed",
+        "mix",
+        "multi",
+        "multilingual",
+        "unknown",
+    }:
+        request_payload["extra_body"]["asr_options"]["language"] = normalized_language
+
+    print(
+        f"[DEBUG] {model_label} chat fallback request model={effective_model} "
+        f"language={language or '-'} base_url={base_url} endpoints={len(endpoints)} "
+        f"audio_bytes={len(audio_bytes)}"
+    )
+
+    for endpoint in endpoints:
+        try:
+            response = requests.post(
+                endpoint,
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type": "application/json",
+                },
+                data=json.dumps(request_payload, ensure_ascii=False),
+                timeout=300,
+            )
+        except Exception as exc:
+            error_text = f"request_error={str(exc)[:420]}"
+            failure_details.append(
+                f"endpoint={endpoint}; status=request_error; detail={error_text}"
+            )
+            continue
+
+        payload: Any = None
+        try:
+            payload = response.json()
+        except Exception:
+            payload = None
+
+        if int(response.status_code) >= 400:
+            error_text = _extract_asr_error_message(
+                payload,
+                fallback_text=str(response.text or "")[:600],
+            )
+            failure_detail = (
+                f"endpoint={endpoint}; status={int(response.status_code)}; "
+                f"detail={error_text[:420]}"
+            )
+            failure_details.append(failure_detail)
+            print(f"[DEBUG] {model_label} chat fallback failed {failure_detail}")
+            continue
+
+        if not isinstance(payload, dict):
+            body_preview = str(response.text or "")[:420]
+            failure_detail = (
+                f"endpoint={endpoint}; status=200; detail=non_json_body:{body_preview}"
+            )
+            failure_details.append(failure_detail)
+            print(f"[DEBUG] {model_label} chat fallback failed {failure_detail}")
+            continue
+
+        text = _extract_text_from_chat_completion_payload(payload)
+        if text:
+            print(
+                f"[DEBUG] {model_label} chat fallback success endpoint={endpoint} text_len={len(text)}"
+            )
+            return [{"start": 0.0, "end": 0.8, "text": text, "words": []}]
+
+        payload_keys = list(payload.keys())[:16]
+        failure_detail = (
+            f"endpoint={endpoint}; status=200; "
+            f"detail=unrecognized_payload_keys:{payload_keys}"
+        )
+        failure_details.append(failure_detail)
+        print(f"[DEBUG] {model_label} chat fallback failed {failure_detail}")
+
+    raise PipelineError(
+        "asr",
+        "cloud_asr_failed",
+        f"{model_label} 云端识别结果缺少可解析文本",
         detail="\n".join(failure_details)[:1200],
     )
 
@@ -2280,17 +2499,32 @@ def _transcribe_qwen3_asr_flash_filetrans(
 ) -> list[dict]:
     if not _is_dashscope_base_url_for_asr(whisper.base_url):
         requested_model = (whisper.model or "").strip()
-        model = _CLOUD_QWEN_ASR_MODEL
+        model = requested_model or _CLOUD_QWEN_ASR_OPENAI_COMPAT_MODEL
+        if model.lower() == _CLOUD_QWEN_ASR_MODEL:
+            model = _CLOUD_QWEN_ASR_OPENAI_COMPAT_MODEL
         print(
             f"[DEBUG] Qwen ASR cloud request model={model} "
             f"requested_model={requested_model or '-'}"
         )
-        return _transcribe_cloud_openai_compatible(
-            audio_path,
-            whisper,
-            model=model,
-            model_label="Qwen ASR",
-        )
+        try:
+            return _transcribe_cloud_openai_compatible(
+                audio_path,
+                whisper,
+                model=model,
+                model_label="Qwen ASR",
+            )
+        except PipelineError as exc:
+            print(
+                "[DEBUG] Qwen ASR transcriptions endpoint unavailable, "
+                "fallback to chat-completions input_audio "
+                f"code={exc.code} message={exc.message}"
+            )
+            return _transcribe_qwen3_asr_chat_openai_compatible(
+                audio_path,
+                whisper,
+                model=model,
+                model_label="Qwen ASR",
+            )
 
     api_key = (whisper.api_key or "").strip()
     if not api_key:
