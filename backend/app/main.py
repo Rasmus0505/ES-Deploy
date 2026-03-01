@@ -16,7 +16,16 @@ from time import time
 from urllib.parse import urlparse
 
 import requests
-from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, Response, UploadFile
+from fastapi import (
+    Depends,
+    FastAPI,
+    File,
+    Form,
+    HTTPException,
+    Request,
+    Response,
+    UploadFile,
+)
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from openai import OpenAI
@@ -36,11 +45,16 @@ from app.provider_url_rules import (
 from app.reading_pipeline import PIPELINE_VERSION as READING_PIPELINE_VERSION
 from app.reading_pipeline import QUALITY_RETRY_BUDGET as READING_QUALITY_RETRY_BUDGET
 from app.reading_pipeline import QUALITY_STRATEGY_TAG as READING_QUALITY_STRATEGY_TAG
-from app.reading_pipeline import ReadingPipelineError, generate_reading_material, grade_short_answer
+from app.reading_pipeline import (
+    ReadingPipelineError,
+    generate_reading_material,
+    grade_short_answer,
+)
 from app.reading_store import SqliteReadingStore
 from app.security_crypto import mask_secret
 from app.url_ingest import evaluate_source_url_policy, normalize_source_url
 from app.schemas import (
+    AsrConsoleResponse,
     AuthLoginRequest,
     AuthLogoutResponse,
     AuthRegisterRequest,
@@ -105,7 +119,9 @@ DEFAULT_PROFILE_LLM_MODEL = "gpt-5.2"
 READING_CACHE_LLM_SIGNATURE_KEY = "_llm_signature"
 READING_CACHE_QUALITY_STRATEGY_KEY = "quality_strategy"
 READING_CACHE_QUALITY_RETRY_KEY = "quality_retry_budget"
-BROWSER_ERRORS_DEPRECATION_HEADER = "browser-errors endpoints will be removed after 14-day grace period"
+BROWSER_ERRORS_DEPRECATION_HEADER = (
+    "browser-errors endpoints will be removed after 14-day grace period"
+)
 BROWSER_ERRORS_DEPRECATION_END_DATE = "2026-03-12"
 DEFAULT_CORS_ALLOW_ORIGINS = (
     "http://localhost:5173",
@@ -115,16 +131,60 @@ DEFAULT_CORS_ALLOW_ORIGINS = (
 )
 DEFAULT_GLOBAL_JOB_LIMIT = 3
 DEFAULT_USER_JOB_LIMIT = 1
-ONEAPI_BASE_URL = str(os.getenv("ONEAPI_BASE_URL", "http://127.0.0.1:3000")).strip().rstrip("/")
+ONEAPI_BASE_URL = (
+    str(os.getenv("ONEAPI_BASE_URL", "http://127.0.0.1:3000")).strip().rstrip("/")
+)
 ONEAPI_API_PREFIX = str(os.getenv("ONEAPI_API_PREFIX", "/api")).strip() or "/api"
 if not ONEAPI_API_PREFIX.startswith("/"):
     ONEAPI_API_PREFIX = f"/{ONEAPI_API_PREFIX}"
-ONEAPI_V1_BASE_URL = str(os.getenv("ONEAPI_V1_BASE_URL", "")).strip() or f"{ONEAPI_BASE_URL}/v1"
+ONEAPI_V1_BASE_URL = (
+    str(os.getenv("ONEAPI_V1_BASE_URL", "")).strip() or f"{ONEAPI_BASE_URL}/v1"
+)
 WALLET_COST_MULTIPLIER = max(0.01, float(os.getenv("WALLET_COST_MULTIPLIER", "3") or 3))
+ASR_WALLET_COST_MULTIPLIER = max(
+    0.0,
+    float(
+        os.getenv("ASR_WALLET_COST_MULTIPLIER", str(WALLET_COST_MULTIPLIER))
+        or WALLET_COST_MULTIPLIER
+    ),
+)
+WALLET_QUOTA_PER_CNY = max(
+    1, int(float(os.getenv("WALLET_QUOTA_PER_CNY", "100000") or 100000))
+)
+DASHSCOPE_ASR_BASE_URL = _normalize_whisper_base_url(
+    str(
+        os.getenv(
+            "DASHSCOPE_ASR_BASE_URL",
+            "https://dashscope.aliyuncs.com/compatible-mode/v1",
+        )
+    )
+)
+DASHSCOPE_ASR_API_KEY = str(os.getenv("DASHSCOPE_API_KEY", "")).strip()
+ASR_SUBMIT_MIN_REMAINING_QUOTA = max(
+    1, int(float(os.getenv("ASR_SUBMIT_MIN_REMAINING_QUOTA", "1") or 1))
+)
 DEFAULT_WALLET_PACKS = [
-    {"id": "trial", "label": "试用包", "price": 0.9, "quota": 90000, "description": "低门槛快速体验"},
-    {"id": "standard", "label": "标准包", "price": 9.9, "quota": 990000, "description": "日常高频学习"},
-    {"id": "pro", "label": "进阶包", "price": 99.0, "quota": 9900000, "description": "长期稳定使用"},
+    {
+        "id": "trial",
+        "label": "试用包",
+        "price": 0.9,
+        "quota": 90000,
+        "description": "低门槛快速体验",
+    },
+    {
+        "id": "standard",
+        "label": "标准包",
+        "price": 9.9,
+        "quota": 990000,
+        "description": "日常高频学习",
+    },
+    {
+        "id": "pro",
+        "label": "进阶包",
+        "price": 99.0,
+        "quota": 9900000,
+        "description": "长期稳定使用",
+    },
 ]
 
 
@@ -174,8 +234,10 @@ def _resolve_wallet_packs() -> list[dict]:
             continue
         normalized.append(
             {
-                "id": str(item.get("id") or f"pack_{idx + 1}").strip() or f"pack_{idx + 1}",
-                "label": str(item.get("label") or f"套餐{idx + 1}").strip() or f"套餐{idx + 1}",
+                "id": str(item.get("id") or f"pack_{idx + 1}").strip()
+                or f"pack_{idx + 1}",
+                "label": str(item.get("label") or f"套餐{idx + 1}").strip()
+                or f"套餐{idx + 1}",
                 "price": round(price, 2),
                 "quota": quota,
                 "description": str(item.get("description") or "").strip(),
@@ -187,19 +249,24 @@ def _resolve_wallet_packs() -> list[dict]:
 WALLET_PACKS = _resolve_wallet_packs()
 
 
-def _build_oneapi_user_llm_payload(*, access_token: str, raw_llm: dict | None = None) -> dict:
+def _build_oneapi_user_llm_payload(
+    *, access_token: str, raw_llm: dict | None = None
+) -> dict:
     safe = _sanitize_llm_options_payload(raw_llm if isinstance(raw_llm, dict) else None)
     return _sanitize_llm_options_payload(
         {
             "base_url": ONEAPI_V1_BASE_URL,
             "api_key": str(access_token or "").strip(),
-            "model": str(safe.get("model") or DEFAULT_PROFILE_LLM_MODEL).strip() or DEFAULT_PROFILE_LLM_MODEL,
+            "model": str(safe.get("model") or DEFAULT_PROFILE_LLM_MODEL).strip()
+            or DEFAULT_PROFILE_LLM_MODEL,
             "llm_support_json": bool(safe.get("llm_support_json", False)),
         }
     )
 
 
-def _build_oneapi_user_whisper_payload(*, access_token: str, raw_whisper: dict | None = None) -> dict:
+def _build_oneapi_user_whisper_payload(
+    *, access_token: str, raw_whisper: dict | None = None
+) -> dict:
     safe = raw_whisper if isinstance(raw_whisper, dict) else {}
     runtime = str(safe.get("runtime") or "cloud").strip().lower()
     if runtime not in {"cloud", "local"}:
@@ -208,6 +275,19 @@ def _build_oneapi_user_whisper_payload(*, access_token: str, raw_whisper: dict |
     model = str(safe.get("model") or "").strip() or default_model
     language = str(safe.get("language") or "").strip() or "en"
     if runtime == "cloud":
+        if DASHSCOPE_ASR_API_KEY:
+            print(
+                "[DEBUG] ASR route selected: direct_dashscope "
+                f"model={model} base_url={DASHSCOPE_ASR_BASE_URL}"
+            )
+            return {
+                "runtime": "cloud",
+                "model": model,
+                "language": language,
+                "base_url": DASHSCOPE_ASR_BASE_URL,
+                "api_key": DASHSCOPE_ASR_API_KEY,
+            }
+        print("[DEBUG] ASR route selected: oneapi_fallback (missing DASHSCOPE_API_KEY)")
         return {
             "runtime": "cloud",
             "model": model,
@@ -224,14 +304,22 @@ def _build_oneapi_user_whisper_payload(*, access_token: str, raw_whisper: dict |
     }
 
 
-def _inject_job_model_options_from_principal(*, options: dict, principal: AuthPrincipal) -> dict:
+def _inject_job_model_options_from_principal(
+    *, options: dict, principal: AuthPrincipal
+) -> dict:
     safe_options = dict(options if isinstance(options, dict) else {})
-    llm_raw = safe_options.get("llm") if isinstance(safe_options.get("llm"), dict) else {}
+    llm_raw = (
+        safe_options.get("llm") if isinstance(safe_options.get("llm"), dict) else {}
+    )
     safe_options["llm"] = _build_oneapi_user_llm_payload(
         access_token=principal.access_token,
         raw_llm=llm_raw if isinstance(llm_raw, dict) else None,
     )
-    whisper_raw = safe_options.get("whisper") if isinstance(safe_options.get("whisper"), dict) else {}
+    whisper_raw = (
+        safe_options.get("whisper")
+        if isinstance(safe_options.get("whisper"), dict)
+        else {}
+    )
     safe_options["whisper"] = _build_oneapi_user_whisper_payload(
         access_token=principal.access_token,
         raw_whisper=whisper_raw if isinstance(whisper_raw, dict) else None,
@@ -239,9 +327,13 @@ def _inject_job_model_options_from_principal(*, options: dict, principal: AuthPr
     return safe_options
 
 
-def _inject_subtitle_options_from_principal(*, payload: SubtitleJobOptions, principal: AuthPrincipal) -> SubtitleJobOptions:
+def _inject_subtitle_options_from_principal(
+    *, payload: SubtitleJobOptions, principal: AuthPrincipal
+) -> SubtitleJobOptions:
     raw_options = payload.model_dump()
-    injected = _inject_job_model_options_from_principal(options=raw_options, principal=principal)
+    injected = _inject_job_model_options_from_principal(
+        options=raw_options, principal=principal
+    )
     return SubtitleJobOptions.model_validate(injected)
 
 
@@ -261,8 +353,14 @@ auth_service = AuthService()
 job_manager = SubtitleJobManager(
     runtime_root=str(RUNTIME_JOBS_ROOT),
     db_path=str(LOCAL_SQLITE_DB),
-    global_concurrency_limit=max(1, int(os.getenv("SUBTITLE_GLOBAL_CONCURRENCY", str(DEFAULT_GLOBAL_JOB_LIMIT)))),
-    per_user_concurrency_limit=max(1, int(os.getenv("SUBTITLE_PER_USER_CONCURRENCY", str(DEFAULT_USER_JOB_LIMIT)))),
+    global_concurrency_limit=max(
+        1, int(os.getenv("SUBTITLE_GLOBAL_CONCURRENCY", str(DEFAULT_GLOBAL_JOB_LIMIT)))
+    ),
+    per_user_concurrency_limit=max(
+        1, int(os.getenv("SUBTITLE_PER_USER_CONCURRENCY", str(DEFAULT_USER_JOB_LIMIT)))
+    ),
+    asr_wallet_cost_multiplier=ASR_WALLET_COST_MULTIPLIER,
+    wallet_quota_per_cny=WALLET_QUOTA_PER_CNY,
 )
 LOCAL_WHISPER_MODEL_CANDIDATES = ("tiny", "base", "small", "medium", "large-v3")
 
@@ -278,7 +376,9 @@ def _safe_filename(filename: str) -> str:
 def _validate_subtitle_job_options(options: SubtitleJobOptions) -> dict:
     options_dict = options.model_dump()
     whisper_runtime = (options.whisper.runtime or "cloud").strip().lower()
-    whisper_model = (options.whisper.model or "paraformer-v2").strip() or "paraformer-v2"
+    whisper_model = (
+        options.whisper.model or "paraformer-v2"
+    ).strip() or "paraformer-v2"
     whisper_model_key = whisper_model.lower()
     cloud_only_models = {
         "paraformer-v2",
@@ -334,7 +434,9 @@ def _resolve_error_file(file_name: str) -> Path:
     return safe_path
 
 
-def _append_runtime_error_report(content: str, file_name: str = "browser-error.log") -> None:
+def _append_runtime_error_report(
+    content: str, file_name: str = "browser-error.log"
+) -> None:
     target_path = _resolve_error_file(file_name)
     with target_path.open("a", encoding="utf-8") as stream:
         stream.write(content.rstrip() + "\n")
@@ -364,6 +466,64 @@ def _require_principal(request: Request) -> AuthPrincipal:
         raise _auth_http_exception(exc) from exc
 
 
+def _merge_wallet_quota_with_asr_usage(
+    *, wallet_quota: dict, asr_usage: dict | None = None
+) -> dict:
+    safe_wallet = wallet_quota if isinstance(wallet_quota, dict) else {}
+    safe_asr = asr_usage if isinstance(asr_usage, dict) else {}
+    quota = max(0, int(safe_wallet.get("quota") or 0))
+    used_quota = max(0, int(safe_wallet.get("used_quota") or 0))
+    asr_used_quota = max(0, int(safe_asr.get("billed_quota") or 0))
+    effective_used_quota = used_quota + asr_used_quota
+    return {
+        "user_id": str(safe_wallet.get("user_id") or ""),
+        "username": str(safe_wallet.get("username") or ""),
+        "quota": quota,
+        "used_quota": effective_used_quota,
+        "remaining_quota": max(0, quota - effective_used_quota),
+        "request_count": max(0, int(safe_wallet.get("request_count") or 0)),
+        "asr_used_quota": asr_used_quota,
+        "asr_charge_count": max(0, int(safe_asr.get("charge_count") or 0)),
+    }
+
+
+def _get_effective_wallet_quota(principal: AuthPrincipal) -> dict:
+    wallet_quota = auth_service.get_wallet_quota(principal)
+    asr_usage = job_manager.get_user_asr_wallet_usage(user_id=principal.user_id)
+    return _merge_wallet_quota_with_asr_usage(
+        wallet_quota=wallet_quota, asr_usage=asr_usage
+    )
+
+
+def _ensure_asr_submit_quota(principal: AuthPrincipal, options: dict) -> None:
+    safe_options = options if isinstance(options, dict) else {}
+    whisper = (
+        safe_options.get("whisper")
+        if isinstance(safe_options.get("whisper"), dict)
+        else {}
+    )
+    runtime = str((whisper or {}).get("runtime") or "cloud").strip().lower() or "cloud"
+    if runtime != "cloud":
+        return
+    try:
+        quota_payload = _get_effective_wallet_quota(principal)
+    except AuthError as exc:
+        raise _auth_http_exception(exc) from exc
+    remaining_quota = max(0, int(quota_payload.get("remaining_quota") or 0))
+    if remaining_quota >= ASR_SUBMIT_MIN_REMAINING_QUOTA:
+        return
+    raise HTTPException(
+        status_code=402,
+        detail={
+            "code": "asr_wallet_quota_exhausted",
+            "message": "当前余额不足，无法发起 ASR 任务，请先充值",
+            "remaining_quota": remaining_quota,
+            "required_quota": ASR_SUBMIT_MIN_REMAINING_QUOTA,
+            "wallet": quota_payload,
+        },
+    )
+
+
 def _to_wallet_quota_response(payload: dict) -> WalletQuotaResponse:
     safe = payload if isinstance(payload, dict) else {}
     return WalletQuotaResponse.model_validate(
@@ -384,6 +544,57 @@ def _to_wallet_packs_response() -> WalletPacksResponse:
         {
             "packs": packs,
             "cost_multiplier": WALLET_COST_MULTIPLIER,
+        }
+    )
+
+
+def _resolve_asr_route_mode() -> str:
+    if DASHSCOPE_ASR_API_KEY:
+        return "dashscope_direct"
+    return "oneapi_fallback"
+
+
+def _to_asr_console_response(
+    *,
+    principal: AuthPrincipal,
+    wallet_quota: dict,
+    asr_usage: dict,
+    charges: list[dict[str, Any]],
+) -> AsrConsoleResponse:
+    route_mode = _resolve_asr_route_mode()
+    route_base_url = (
+        DASHSCOPE_ASR_BASE_URL
+        if route_mode == "dashscope_direct"
+        else ONEAPI_V1_BASE_URL
+    )
+    safe_wallet = wallet_quota if isinstance(wallet_quota, dict) else {}
+    safe_usage = asr_usage if isinstance(asr_usage, dict) else {}
+    safe_charges = charges if isinstance(charges, list) else []
+    api_key_value = DASHSCOPE_ASR_API_KEY if route_mode == "dashscope_direct" else ""
+    return AsrConsoleResponse.model_validate(
+        {
+            "route_mode": route_mode,
+            "route_base_url": route_base_url,
+            "api_key_configured": bool(api_key_value),
+            "api_key_masked": mask_secret(api_key_value),
+            "cost_multiplier": ASR_WALLET_COST_MULTIPLIER,
+            "quota_per_cny": WALLET_QUOTA_PER_CNY,
+            "submit_min_remaining_quota": ASR_SUBMIT_MIN_REMAINING_QUOTA,
+            "user_id": str(safe_wallet.get("user_id") or principal.user_id),
+            "username": str(safe_wallet.get("username") or principal.username),
+            "quota": max(0, int(safe_wallet.get("quota") or 0)),
+            "used_quota": max(0, int(safe_wallet.get("used_quota") or 0)),
+            "remaining_quota": max(0, int(safe_wallet.get("remaining_quota") or 0)),
+            "request_count": max(0, int(safe_wallet.get("request_count") or 0)),
+            "asr_used_quota": max(0, int(safe_usage.get("billed_quota") or 0)),
+            "asr_charge_count": max(0, int(safe_usage.get("charge_count") or 0)),
+            "asr_base_cost_cny": max(
+                0.0, float(safe_usage.get("base_cost_cny") or 0.0)
+            ),
+            "asr_billed_cost_cny": max(
+                0.0, float(safe_usage.get("billed_cost_cny") or 0.0)
+            ),
+            "charges": safe_charges,
         }
     )
 
@@ -409,9 +620,15 @@ def _infer_llm_provider_effective(base_url: str) -> str:
 
 def _extract_llm_usage_from_payload(payload: dict | None) -> dict:
     safe_payload = payload if isinstance(payload, dict) else {}
-    usage = safe_payload.get("usage") if isinstance(safe_payload.get("usage"), dict) else {}
-    prompt_tokens = _safe_positive_int(usage.get("input_tokens") or usage.get("prompt_tokens"))
-    completion_tokens = _safe_positive_int(usage.get("output_tokens") or usage.get("completion_tokens"))
+    usage = (
+        safe_payload.get("usage") if isinstance(safe_payload.get("usage"), dict) else {}
+    )
+    prompt_tokens = _safe_positive_int(
+        usage.get("input_tokens") or usage.get("prompt_tokens")
+    )
+    completion_tokens = _safe_positive_int(
+        usage.get("output_tokens") or usage.get("completion_tokens")
+    )
     total_tokens = _safe_positive_int(usage.get("total_tokens"))
     if total_tokens <= 0:
         total_tokens = prompt_tokens + completion_tokens
@@ -419,7 +636,9 @@ def _extract_llm_usage_from_payload(payload: dict | None) -> dict:
         "prompt_tokens": prompt_tokens,
         "completion_tokens": completion_tokens,
         "total_tokens": total_tokens,
-        "llm_request_count": 1 if (prompt_tokens > 0 or completion_tokens > 0 or total_tokens > 0) else 0,
+        "llm_request_count": 1
+        if (prompt_tokens > 0 or completion_tokens > 0 or total_tokens > 0)
+        else 0,
         "provider_request_id": str(safe_payload.get("id") or "").strip(),
     }
 
@@ -443,7 +662,9 @@ def _extract_llm_usage_from_chat_response(response) -> dict:
         "prompt_tokens": prompt_tokens,
         "completion_tokens": completion_tokens,
         "total_tokens": total_tokens,
-        "llm_request_count": 1 if (prompt_tokens > 0 or completion_tokens > 0 or total_tokens > 0) else 0,
+        "llm_request_count": 1
+        if (prompt_tokens > 0 or completion_tokens > 0 or total_tokens > 0)
+        else 0,
         "provider_request_id": str(getattr(response, "id", "") or "").strip(),
     }
 
@@ -468,11 +689,15 @@ def _build_llm_cost_stats(*, base_url: str, model: str, usage: dict | None) -> d
         "completion_tokens": completion_tokens,
         "total_tokens": total_tokens,
         "llm_request_count": request_count,
-        "provider_request_id": str(usage_payload.get("provider_request_id") or "").strip(),
+        "provider_request_id": str(
+            usage_payload.get("provider_request_id") or ""
+        ).strip(),
     }
 
 
-def _append_llm_cost_for_scene(*, scene: str, owner_id: str, base_url: str, model: str, usage: dict | None) -> None:
+def _append_llm_cost_for_scene(
+    *, scene: str, owner_id: str, base_url: str, model: str, usage: dict | None
+) -> None:
     stats = _build_llm_cost_stats(base_url=base_url, model=model, usage=usage)
     if int(stats.get("total_tokens") or 0) <= 0:
         return
@@ -487,14 +712,18 @@ def _append_llm_cost_for_scene(*, scene: str, owner_id: str, base_url: str, mode
     )
 
 
-def _test_llm_config(options: SubtitleJobOptions) -> tuple[SubtitleConfigProbeResult, dict]:
+def _test_llm_config(
+    options: SubtitleJobOptions,
+) -> tuple[SubtitleConfigProbeResult, dict]:
     llm_key = (options.llm.api_key or "").strip()
     if not llm_key:
         return SubtitleConfigProbeResult(ok=False, message="LLM API Key 为空"), {}
 
     raw_base_url = options.llm.base_url
     base_url = _normalize_llm_base_url(raw_base_url)
-    protocol_candidates = _infer_llm_protocol_candidates(raw_base_url, options.llm.model)
+    protocol_candidates = _infer_llm_protocol_candidates(
+        raw_base_url, options.llm.model
+    )
     print(
         f"[DEBUG] LLM probe protocol candidates={protocol_candidates} "
         f"base_url={base_url} model={options.llm.model}"
@@ -510,7 +739,12 @@ def _test_llm_config(options: SubtitleJobOptions) -> tuple[SubtitleConfigProbeRe
                     {
                         "type": "message",
                         "role": "developer",
-                        "content": [{"type": "input_text", "text": "You are a connectivity probe. Reply briefly."}],
+                        "content": [
+                            {
+                                "type": "input_text",
+                                "text": "You are a connectivity probe. Reply briefly.",
+                            }
+                        ],
                     },
                     {
                         "type": "message",
@@ -531,7 +765,9 @@ def _test_llm_config(options: SubtitleJobOptions) -> tuple[SubtitleConfigProbeRe
             last_error = ""
             for index, request_payload in enumerate(payload_candidates):
                 if index > 0:
-                    print("[DEBUG] LLM probe retrying Responses API with minimal payload")
+                    print(
+                        "[DEBUG] LLM probe retrying Responses API with minimal payload"
+                    )
                 try:
                     response = requests.post(
                         endpoint,
@@ -552,25 +788,37 @@ def _test_llm_config(options: SubtitleJobOptions) -> tuple[SubtitleConfigProbeRe
                         payload = response.json()
                     except Exception:
                         payload = {}
-                    output_preview = _extract_responses_output_text(payload if isinstance(payload, dict) else {})
+                    output_preview = _extract_responses_output_text(
+                        payload if isinstance(payload, dict) else {}
+                    )
                     print(
                         f"[DEBUG] LLM probe success protocol=responses status={response.status_code} "
                         f"output_len={len(output_preview)}"
                     )
-                    usage = _extract_llm_usage_from_payload(payload if isinstance(payload, dict) else {})
+                    usage = _extract_llm_usage_from_payload(
+                        payload if isinstance(payload, dict) else {}
+                    )
                     if not str(usage.get("provider_request_id") or "").strip():
                         headers = getattr(response, "headers", {})
                         try:
-                            usage["provider_request_id"] = str(headers.get("x-request-id") or "").strip()
+                            usage["provider_request_id"] = str(
+                                headers.get("x-request-id") or ""
+                            ).strip()
                         except Exception:
                             usage["provider_request_id"] = ""
-                    return SubtitleConfigProbeResult(ok=True, message="LLM Responses 连通性测试通过"), usage
+                    return SubtitleConfigProbeResult(
+                        ok=True, message="LLM Responses 连通性测试通过"
+                    ), usage
 
                 last_status = int(response.status_code)
                 last_error = f"body={str(response.text or '')[:420]}"
 
-            status_tag = str(last_status) if last_status is not None else "request_error"
-            failure_detail = f"protocol=responses; status={status_tag}; detail={last_error[:420]}"
+            status_tag = (
+                str(last_status) if last_status is not None else "request_error"
+            )
+            failure_detail = (
+                f"protocol=responses; status={status_tag}; detail={last_error[:420]}"
+            )
             probe_failures.append(failure_detail)
             print(f"[DEBUG] LLM probe failed {failure_detail}")
             if _should_fallback_protocol(last_status, last_error):
@@ -593,14 +841,18 @@ def _test_llm_config(options: SubtitleJobOptions) -> tuple[SubtitleConfigProbeRe
             )
             print("[DEBUG] LLM probe success protocol=chat.completions")
             usage = _extract_llm_usage_from_chat_response(chat_response)
-            return SubtitleConfigProbeResult(ok=True, message="LLM 连通性测试通过"), usage
+            return SubtitleConfigProbeResult(
+                ok=True, message="LLM 连通性测试通过"
+            ), usage
         except Exception as exc:
             error_detail = f"error={str(exc)[:420]}"
             failure_detail = f"protocol=chat.completions; status=request_error; detail={error_detail}"
             probe_failures.append(failure_detail)
             print(f"[DEBUG] LLM probe failed {failure_detail}")
             if _should_fallback_protocol(None, error_detail):
-                print("[DEBUG] LLM probe falling back from chat.completions to next protocol")
+                print(
+                    "[DEBUG] LLM probe falling back from chat.completions to next protocol"
+                )
                 continue
             return SubtitleConfigProbeResult(
                 ok=False,
@@ -608,7 +860,10 @@ def _test_llm_config(options: SubtitleJobOptions) -> tuple[SubtitleConfigProbeRe
                 detail="\n".join(probe_failures)[:1200],
             ), {}
 
-    attempts = " -> ".join("chat.completions" if item == "chat" else "responses" for item in protocol_candidates)
+    attempts = " -> ".join(
+        "chat.completions" if item == "chat" else "responses"
+        for item in protocol_candidates
+    )
     return SubtitleConfigProbeResult(
         ok=False,
         message=f"LLM 连通性测试失败（已尝试 {attempts}）",
@@ -619,7 +874,11 @@ def _test_llm_config(options: SubtitleJobOptions) -> tuple[SubtitleConfigProbeRe
 def _normalize_llm_probe_output(raw_result) -> tuple[SubtitleConfigProbeResult, dict]:
     if isinstance(raw_result, tuple) and len(raw_result) == 2:
         probe_result, usage = raw_result
-        safe_probe = probe_result if isinstance(probe_result, SubtitleConfigProbeResult) else SubtitleConfigProbeResult(ok=False, message="LLM 连通性测试失败")
+        safe_probe = (
+            probe_result
+            if isinstance(probe_result, SubtitleConfigProbeResult)
+            else SubtitleConfigProbeResult(ok=False, message="LLM 连通性测试失败")
+        )
         safe_usage = usage if isinstance(usage, dict) else {}
         return safe_probe, safe_usage
     if isinstance(raw_result, SubtitleConfigProbeResult):
@@ -627,7 +886,9 @@ def _normalize_llm_probe_output(raw_result) -> tuple[SubtitleConfigProbeResult, 
     return SubtitleConfigProbeResult(ok=False, message="LLM 连通性测试失败"), {}
 
 
-def _build_silent_wav_bytes(duration_seconds: float = 0.3, sample_rate: int = 16000) -> bytes:
+def _build_silent_wav_bytes(
+    duration_seconds: float = 0.3, sample_rate: int = 16000
+) -> bytes:
     frame_count = max(1, int(duration_seconds * sample_rate))
     audio_buffer = BytesIO()
     with wave.open(audio_buffer, "wb") as wav_file:
@@ -641,7 +902,9 @@ def _build_silent_wav_bytes(duration_seconds: float = 0.3, sample_rate: int = 16
 def _test_whisper_cloud(options: SubtitleJobOptions) -> SubtitleConfigProbeResult:
     whisper_key = (options.whisper.api_key or "").strip()
     if not whisper_key:
-        return SubtitleConfigProbeResult(ok=False, message="Whisper API Key 为空（cloud 模式必填）")
+        return SubtitleConfigProbeResult(
+            ok=False, message="Whisper API Key 为空（cloud 模式必填）"
+        )
 
     requested_model = str(options.whisper.model or "").strip().lower()
     if requested_model == "qwen3-asr-flash-filetrans":
@@ -666,7 +929,9 @@ def _test_whisper_cloud(options: SubtitleJobOptions) -> SubtitleConfigProbeResul
             api_key=whisper_key,
         )
         transcribe_func(str(probe_path), whisper_options)
-        return SubtitleConfigProbeResult(ok=True, message=f"{model_label} 云端连通性测试通过")
+        return SubtitleConfigProbeResult(
+            ok=True, message=f"{model_label} 云端连通性测试通过"
+        )
     except PipelineError as exc:
         raw_detail = str(exc.detail or "")
         subtask_code = ""
@@ -678,10 +943,21 @@ def _test_whisper_cloud(options: SubtitleJobOptions) -> SubtitleConfigProbeResul
                     subtask_code = "SUCCESS_WITH_NO_VALID_FRAGMENT"
             else:
                 if isinstance(detail_payload, dict):
-                    subtask_code = str(detail_payload.get("subtask_code") or "").strip().upper()
-        if exc.code == "cloud_asr_failed" and subtask_code == "SUCCESS_WITH_NO_VALID_FRAGMENT":
-            detail = f"stage={exc.stage}; code={exc.code}; detail={raw_detail}" if raw_detail else f"stage={exc.stage}; code={exc.code}"
-            print("[DEBUG] Whisper probe treats SUCCESS_WITH_NO_VALID_FRAGMENT as connectivity success")
+                    subtask_code = (
+                        str(detail_payload.get("subtask_code") or "").strip().upper()
+                    )
+        if (
+            exc.code == "cloud_asr_failed"
+            and subtask_code == "SUCCESS_WITH_NO_VALID_FRAGMENT"
+        ):
+            detail = (
+                f"stage={exc.stage}; code={exc.code}; detail={raw_detail}"
+                if raw_detail
+                else f"stage={exc.stage}; code={exc.code}"
+            )
+            print(
+                "[DEBUG] Whisper probe treats SUCCESS_WITH_NO_VALID_FRAGMENT as connectivity success"
+            )
             return SubtitleConfigProbeResult(
                 ok=True,
                 message=f"{model_label} 云端连通性测试通过（静音探活，无有效语音片段）",
@@ -692,9 +968,15 @@ def _test_whisper_cloud(options: SubtitleJobOptions) -> SubtitleConfigProbeResul
             if raw_detail
             else f"stage={exc.stage}; code={exc.code}"
         )
-        return SubtitleConfigProbeResult(ok=False, message=exc.message or f"{model_label} 云端测试失败", detail=detail[:500])
+        return SubtitleConfigProbeResult(
+            ok=False,
+            message=exc.message or f"{model_label} 云端测试失败",
+            detail=detail[:500],
+        )
     except Exception as exc:
-        return SubtitleConfigProbeResult(ok=False, message=f"{model_label} 云端请求失败", detail=str(exc)[:500])
+        return SubtitleConfigProbeResult(
+            ok=False, message=f"{model_label} 云端请求失败", detail=str(exc)[:500]
+        )
     finally:
         try:
             probe_path.unlink(missing_ok=True)
@@ -779,7 +1061,9 @@ def _test_whisper_config(options: SubtitleJobOptions) -> SubtitleConfigProbeResu
         return _test_whisper_local()
     if runtime == "cloud":
         return _test_whisper_cloud(options)
-    return SubtitleConfigProbeResult(ok=False, message=f"不支持的 whisper.runtime: {runtime}")
+    return SubtitleConfigProbeResult(
+        ok=False, message=f"不支持的 whisper.runtime: {runtime}"
+    )
 
 
 def _infer_reading_source_names(record, payload: dict) -> tuple[str, str]:
@@ -845,7 +1129,9 @@ def _sanitize_llm_options_payload(raw: dict | None) -> dict:
 
 
 def _is_llm_payload_ready(payload: dict | None) -> bool:
-    safe_payload = _sanitize_llm_options_payload(payload if isinstance(payload, dict) else None)
+    safe_payload = _sanitize_llm_options_payload(
+        payload if isinstance(payload, dict) else None
+    )
     return bool(
         str(safe_payload.get("base_url") or "").strip()
         and str(safe_payload.get("model") or "").strip()
@@ -854,9 +1140,15 @@ def _is_llm_payload_ready(payload: dict | None) -> bool:
 
 
 def _build_reading_llm_signature(payload: dict | None) -> str:
-    safe_payload = _sanitize_llm_options_payload(payload if isinstance(payload, dict) else None)
+    safe_payload = _sanitize_llm_options_payload(
+        payload if isinstance(payload, dict) else None
+    )
     api_key = str(safe_payload.get("api_key") or "")
-    api_key_hash = hashlib.sha256(api_key.encode("utf-8")).hexdigest()[:16] if api_key else "missing"
+    api_key_hash = (
+        hashlib.sha256(api_key.encode("utf-8")).hexdigest()[:16]
+        if api_key
+        else "missing"
+    )
     normalized = "|".join(
         [
             str(safe_payload.get("base_url") or "").strip().lower(),
@@ -868,9 +1160,15 @@ def _build_reading_llm_signature(payload: dict | None) -> str:
     return hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:24]
 
 
-def _is_reading_cache_compatible(*, material: dict | None, llm_signature: str) -> tuple[bool, str]:
+def _is_reading_cache_compatible(
+    *, material: dict | None, llm_signature: str
+) -> tuple[bool, str]:
     safe_material = material if isinstance(material, dict) else {}
-    config = safe_material.get("config") if isinstance(safe_material.get("config"), dict) else {}
+    config = (
+        safe_material.get("config")
+        if isinstance(safe_material.get("config"), dict)
+        else {}
+    )
     cached_strategy = str(config.get(READING_CACHE_QUALITY_STRATEGY_KEY) or "").strip()
     cached_signature = str(config.get(READING_CACHE_LLM_SIGNATURE_KEY) or "").strip()
     try:
@@ -889,16 +1187,30 @@ def _is_reading_cache_compatible(*, material: dict | None, llm_signature: str) -
 def _normalize_profile_settings_payload(payload: dict | None) -> dict:
     data = dict(payload) if isinstance(payload, dict) else {}
     english_level = str(data.get("english_level") or "").strip().lower()
-    if english_level not in {"junior", "senior", "cet4", "cet6", "kaoyan", "toefl", "sat"}:
+    if english_level not in {
+        "junior",
+        "senior",
+        "cet4",
+        "cet6",
+        "kaoyan",
+        "toefl",
+        "sat",
+    }:
         english_level = "cet4"
     llm_mode = str(data.get("llm_mode") or "").strip().lower()
     if llm_mode not in {"unified", "custom"}:
         llm_mode = "unified"
-    llm_unified = _sanitize_llm_options_payload(data.get("llm_unified") if isinstance(data.get("llm_unified"), dict) else None)
-    llm_listening = _sanitize_llm_options_payload(
-        data.get("llm_listening") if isinstance(data.get("llm_listening"), dict) else None
+    llm_unified = _sanitize_llm_options_payload(
+        data.get("llm_unified") if isinstance(data.get("llm_unified"), dict) else None
     )
-    llm_reading = _sanitize_llm_options_payload(data.get("llm_reading") if isinstance(data.get("llm_reading"), dict) else None)
+    llm_listening = _sanitize_llm_options_payload(
+        data.get("llm_listening")
+        if isinstance(data.get("llm_listening"), dict)
+        else None
+    )
+    llm_reading = _sanitize_llm_options_payload(
+        data.get("llm_reading") if isinstance(data.get("llm_reading"), dict) else None
+    )
     return {
         "english_level": english_level,
         "english_level_numeric": float(data.get("english_level_numeric") or 7.5),
@@ -924,17 +1236,25 @@ def _to_public_llm_payload(raw: dict | None) -> dict:
 
 
 def _to_public_profile_settings_payload(payload: dict | None) -> dict:
-    safe = _normalize_profile_settings_payload(payload if isinstance(payload, dict) else {})
+    safe = _normalize_profile_settings_payload(
+        payload if isinstance(payload, dict) else {}
+    )
     return {
         "english_level": str(safe.get("english_level") or "cet4"),
         "english_level_numeric": float(safe.get("english_level_numeric") or 7.5),
         "english_level_cefr": str(safe.get("english_level_cefr") or "B1"),
         "llm_mode": str(safe.get("llm_mode") or "unified"),
-        "llm_unified": _to_public_llm_payload(safe.get("llm_unified") if isinstance(safe.get("llm_unified"), dict) else {}),
-        "llm_listening": _to_public_llm_payload(
-            safe.get("llm_listening") if isinstance(safe.get("llm_listening"), dict) else {}
+        "llm_unified": _to_public_llm_payload(
+            safe.get("llm_unified") if isinstance(safe.get("llm_unified"), dict) else {}
         ),
-        "llm_reading": _to_public_llm_payload(safe.get("llm_reading") if isinstance(safe.get("llm_reading"), dict) else {}),
+        "llm_listening": _to_public_llm_payload(
+            safe.get("llm_listening")
+            if isinstance(safe.get("llm_listening"), dict)
+            else {}
+        ),
+        "llm_reading": _to_public_llm_payload(
+            safe.get("llm_reading") if isinstance(safe.get("llm_reading"), dict) else {}
+        ),
         "updated_at": int(safe.get("updated_at") or 0),
     }
 
@@ -943,9 +1263,21 @@ def _resolve_profile_llm_payload(*, profile: dict, scene: str) -> dict:
     safe_scene = str(scene or "").strip().lower()
     safe_profile = _normalize_profile_settings_payload(profile)
     llm_mode = str(safe_profile.get("llm_mode") or "unified")
-    llm_unified = safe_profile.get("llm_unified") if isinstance(safe_profile.get("llm_unified"), dict) else {}
-    llm_reading = safe_profile.get("llm_reading") if isinstance(safe_profile.get("llm_reading"), dict) else {}
-    llm_listening = safe_profile.get("llm_listening") if isinstance(safe_profile.get("llm_listening"), dict) else {}
+    llm_unified = (
+        safe_profile.get("llm_unified")
+        if isinstance(safe_profile.get("llm_unified"), dict)
+        else {}
+    )
+    llm_reading = (
+        safe_profile.get("llm_reading")
+        if isinstance(safe_profile.get("llm_reading"), dict)
+        else {}
+    )
+    llm_listening = (
+        safe_profile.get("llm_listening")
+        if isinstance(safe_profile.get("llm_listening"), dict)
+        else {}
+    )
 
     if llm_mode == "custom":
         if safe_scene == "reading":
@@ -955,7 +1287,9 @@ def _resolve_profile_llm_payload(*, profile: dict, scene: str) -> dict:
     return _sanitize_llm_options_payload(llm_unified)
 
 
-def _to_reading_material_response(material: dict, *, cached: bool) -> ReadingMaterialResponse:
+def _to_reading_material_response(
+    material: dict, *, cached: bool
+) -> ReadingMaterialResponse:
     safe_material = material if isinstance(material, dict) else {}
     return ReadingMaterialResponse.model_validate(
         {
@@ -968,13 +1302,21 @@ def _to_reading_material_response(material: dict, *, cached: bool) -> ReadingMat
             "difficulty_tier": str(safe_material.get("difficulty_tier") or "balanced"),
             "genre": str(safe_material.get("genre") or "news"),
             "i_plus_one_hit": bool(safe_material.get("i_plus_one_hit")),
-            "pipeline_version": str(safe_material.get("pipeline_version") or READING_PIPELINE_VERSION),
-            "config": safe_material.get("config") if isinstance(safe_material.get("config"), dict) else {},
+            "pipeline_version": str(
+                safe_material.get("pipeline_version") or READING_PIPELINE_VERSION
+            ),
+            "config": safe_material.get("config")
+            if isinstance(safe_material.get("config"), dict)
+            else {},
             "difficulty_report": safe_material.get("difficulty_report")
             if isinstance(safe_material.get("difficulty_report"), dict)
             else {},
-            "materials": safe_material.get("materials") if isinstance(safe_material.get("materials"), list) else [],
-            "quiz": safe_material.get("quiz") if isinstance(safe_material.get("quiz"), dict) else {},
+            "materials": safe_material.get("materials")
+            if isinstance(safe_material.get("materials"), list)
+            else [],
+            "quiz": safe_material.get("quiz")
+            if isinstance(safe_material.get("quiz"), dict)
+            else {},
             "created_at": int(safe_material.get("created_at") or 0),
             "updated_at": int(safe_material.get("updated_at") or 0),
             "cached": bool(cached),
@@ -996,7 +1338,9 @@ def _normalize_material_slot(raw: dict | None, *, kind: str) -> dict:
     }
 
 
-def _merge_material_slots(*, generated_materials: list[dict], previous_materials: list[dict]) -> list[dict]:
+def _merge_material_slots(
+    *, generated_materials: list[dict], previous_materials: list[dict]
+) -> list[dict]:
     generated_map: dict[str, dict] = {}
     previous_map: dict[str, dict] = {}
     for item in generated_materials or []:
@@ -1095,7 +1439,9 @@ def get_health() -> HealthResponse:
 
 
 @app.get("/api/v1/whisper/local-models", response_model=WhisperLocalModelsResponse)
-def get_whisper_local_models(principal: AuthPrincipal = Depends(_require_principal)) -> WhisperLocalModelsResponse:
+def get_whisper_local_models(
+    principal: AuthPrincipal = Depends(_require_principal),
+) -> WhisperLocalModelsResponse:
     _ = principal
     return _probe_local_whisper_models()
 
@@ -1132,7 +1478,9 @@ def test_subtitle_config_llm(
     )
 
 
-@app.post("/api/v1/subtitle-config/test-whisper", response_model=SubtitleConfigTestResponse)
+@app.post(
+    "/api/v1/subtitle-config/test-whisper", response_model=SubtitleConfigTestResponse
+)
 def test_subtitle_config_whisper(
     payload: SubtitleJobOptions,
     principal: AuthPrincipal = Depends(_require_principal),
@@ -1149,7 +1497,9 @@ def test_subtitle_config_whisper(
 
 
 @app.post("/api/v1/browser-errors", response_model=BrowserErrorReportResponse)
-def write_browser_error_report(payload: BrowserErrorReportRequest, response: Response) -> BrowserErrorReportResponse:
+def write_browser_error_report(
+    payload: BrowserErrorReportRequest, response: Response
+) -> BrowserErrorReportResponse:
     _ = payload
     _mark_browser_errors_deprecated(response)
     raise HTTPException(
@@ -1162,7 +1512,9 @@ def write_browser_error_report(payload: BrowserErrorReportRequest, response: Res
 
 
 @app.get("/api/v1/browser-errors/read", response_model=BrowserErrorReadResponse)
-def read_browser_error_report(response: Response, file_name: str = "browser-error.log") -> BrowserErrorReadResponse:
+def read_browser_error_report(
+    response: Response, file_name: str = "browser-error.log"
+) -> BrowserErrorReadResponse:
     _ = file_name
     _mark_browser_errors_deprecated(response)
     raise HTTPException(
@@ -1177,7 +1529,9 @@ def read_browser_error_report(response: Response, file_name: str = "browser-erro
 @app.post("/api/v1/auth/register", response_model=AuthTokenResponse)
 def register(payload: AuthRegisterRequest) -> AuthTokenResponse:
     try:
-        token_payload = auth_service.register(username=payload.username, password=payload.password)
+        token_payload = auth_service.register(
+            username=payload.username, password=payload.password
+        )
     except AuthError as exc:
         raise _auth_http_exception(exc) from exc
     return AuthTokenResponse.model_validate(token_payload)
@@ -1186,20 +1540,26 @@ def register(payload: AuthRegisterRequest) -> AuthTokenResponse:
 @app.post("/api/v1/auth/login", response_model=AuthTokenResponse)
 def login(payload: AuthLoginRequest) -> AuthTokenResponse:
     try:
-        token_payload = auth_service.login(username=payload.username, password=payload.password)
+        token_payload = auth_service.login(
+            username=payload.username, password=payload.password
+        )
     except AuthError as exc:
         raise _auth_http_exception(exc) from exc
     return AuthTokenResponse.model_validate(token_payload)
 
 
 @app.post("/api/v1/auth/logout", response_model=AuthLogoutResponse)
-def logout(principal: AuthPrincipal = Depends(_require_principal)) -> AuthLogoutResponse:
+def logout(
+    principal: AuthPrincipal = Depends(_require_principal),
+) -> AuthLogoutResponse:
     auth_service.logout(principal)
     return AuthLogoutResponse(status="ok")
 
 
 @app.get("/api/v1/auth/me", response_model=AuthUserResponse)
-def get_auth_me(principal: AuthPrincipal = Depends(_require_principal)) -> AuthUserResponse:
+def get_auth_me(
+    principal: AuthPrincipal = Depends(_require_principal),
+) -> AuthUserResponse:
     try:
         user_payload = auth_service.get_user_public(principal)
     except AuthError as exc:
@@ -1208,9 +1568,11 @@ def get_auth_me(principal: AuthPrincipal = Depends(_require_principal)) -> AuthU
 
 
 @app.get("/api/v1/wallet/quota", response_model=WalletQuotaResponse)
-def get_wallet_quota(principal: AuthPrincipal = Depends(_require_principal)) -> WalletQuotaResponse:
+def get_wallet_quota(
+    principal: AuthPrincipal = Depends(_require_principal),
+) -> WalletQuotaResponse:
     try:
-        quota_payload = auth_service.get_wallet_quota(principal)
+        quota_payload = _get_effective_wallet_quota(principal)
     except AuthError as exc:
         raise _auth_http_exception(exc) from exc
     return _to_wallet_quota_response(quota_payload)
@@ -1223,9 +1585,15 @@ def redeem_wallet_code(
 ) -> WalletRedeemResponse:
     try:
         redeemed = auth_service.redeem_code(principal=principal, key=payload.key)
+        asr_usage = job_manager.get_user_asr_wallet_usage(user_id=principal.user_id)
     except AuthError as exc:
         raise _auth_http_exception(exc) from exc
-    return WalletRedeemResponse.model_validate(redeemed)
+    merged = _merge_wallet_quota_with_asr_usage(
+        wallet_quota=redeemed, asr_usage=asr_usage
+    )
+    merged["status"] = str(redeemed.get("status") or "ok")
+    merged["added_quota"] = max(0, int(redeemed.get("added_quota") or 0))
+    return WalletRedeemResponse.model_validate(merged)
 
 
 @app.get("/api/v1/wallet/packs", response_model=WalletPacksResponse)
@@ -1233,8 +1601,37 @@ def get_wallet_packs() -> WalletPacksResponse:
     return _to_wallet_packs_response()
 
 
+@app.get("/api/v1/asr/console", response_model=AsrConsoleResponse)
+def get_asr_console(
+    limit: int = 20,
+    principal: AuthPrincipal = Depends(_require_principal),
+) -> AsrConsoleResponse:
+    safe_limit = max(1, min(200, int(limit or 20)))
+    try:
+        wallet_quota = _get_effective_wallet_quota(principal)
+    except AuthError as exc:
+        raise _auth_http_exception(exc) from exc
+    asr_usage = job_manager.get_user_asr_wallet_usage(user_id=principal.user_id)
+    charges = job_manager.list_user_asr_wallet_charges(
+        user_id=principal.user_id,
+        limit=safe_limit,
+    )
+    print(
+        "[DEBUG] ASR console fetched "
+        f"user_id={principal.user_id} route={_resolve_asr_route_mode()} charges={len(charges)}"
+    )
+    return _to_asr_console_response(
+        principal=principal,
+        wallet_quota=wallet_quota,
+        asr_usage=asr_usage,
+        charges=charges,
+    )
+
+
 @app.get("/api/v1/history-records", response_model=HistoryRecordsResponse)
-def get_history_records(principal: AuthPrincipal = Depends(_require_principal)) -> HistoryRecordsResponse:
+def get_history_records(
+    principal: AuthPrincipal = Depends(_require_principal),
+) -> HistoryRecordsResponse:
     records = history_store.list_records(user_id=principal.user_id)
     return HistoryRecordsResponse(records=records)
 
@@ -1245,19 +1642,25 @@ def sync_history_records(
     principal: AuthPrincipal = Depends(_require_principal),
 ) -> HistoryRecordsSyncResponse:
     normalized_records = [item.model_dump() for item in payload.records]
-    saved_count = history_store.replace_all_records(normalized_records, user_id=principal.user_id)
+    saved_count = history_store.replace_all_records(
+        normalized_records, user_id=principal.user_id
+    )
     records = history_store.list_records(user_id=principal.user_id)
     return HistoryRecordsSyncResponse(saved_count=saved_count, records=records)
 
 
 @app.get("/api/v1/reading/sources", response_model=ReadingSourcesResponse)
-def list_reading_sources(principal: AuthPrincipal = Depends(_require_principal)) -> ReadingSourcesResponse:
+def list_reading_sources(
+    principal: AuthPrincipal = Depends(_require_principal),
+) -> ReadingSourcesResponse:
     sources = reading_store.list_sources(user_id=principal.user_id, limit=300)
     return ReadingSourcesResponse.model_validate({"sources": sources})
 
 
 @app.get("/api/v1/profile/settings", response_model=ProfileSettings)
-def get_profile_settings_api(principal: AuthPrincipal = Depends(_require_principal)) -> ProfileSettings:
+def get_profile_settings_api(
+    principal: AuthPrincipal = Depends(_require_principal),
+) -> ProfileSettings:
     settings = profile_store.get_profile_settings(user_id=principal.user_id)
     normalized = _to_public_profile_settings_payload(settings)
     return ProfileSettings.model_validate(normalized)
@@ -1287,7 +1690,9 @@ def update_profile_keys_api(
     if not patch:
         return ProfileKeysUpdateResponse(status="ok", updated_fields=[])
     profile_store.upsert_profile_api_keys(patch, user_id=principal.user_id)
-    return ProfileKeysUpdateResponse(status="ok", updated_fields=sorted(list(patch.keys())))
+    return ProfileKeysUpdateResponse(
+        status="ok", updated_fields=sorted(list(patch.keys()))
+    )
 
 
 @app.get("/api/v1/reading/history", response_model=ReadingHistoryResponse)
@@ -1298,8 +1703,12 @@ def get_reading_history(
 ) -> ReadingHistoryResponse:
     safe_limit = max(1, min(100, int(limit or 20)))
     safe_offset = max(0, int(offset or 0))
-    items, has_more = reading_store.list_history(user_id=principal.user_id, limit=safe_limit, offset=safe_offset)
-    normalized_items = [ReadingHistoryItem.model_validate(item).model_dump() for item in items]
+    items, has_more = reading_store.list_history(
+        user_id=principal.user_id, limit=safe_limit, offset=safe_offset
+    )
+    normalized_items = [
+        ReadingHistoryItem.model_validate(item).model_dump() for item in items
+    ]
     return ReadingHistoryResponse.model_validate(
         {
             "items": normalized_items,
@@ -1311,22 +1720,35 @@ def get_reading_history(
 
 
 @app.get("/api/v1/reading/versions/{version_id}", response_model=ReadingVersionResponse)
-def get_reading_version(version_id: str, principal: AuthPrincipal = Depends(_require_principal)) -> ReadingVersionResponse:
-    material = reading_store.get_version(user_id=principal.user_id, version_id=version_id)
+def get_reading_version(
+    version_id: str, principal: AuthPrincipal = Depends(_require_principal)
+) -> ReadingVersionResponse:
+    material = reading_store.get_version(
+        user_id=principal.user_id, version_id=version_id
+    )
     if not material:
         raise HTTPException(status_code=404, detail="Reading version not found")
     return ReadingVersionResponse.model_validate({"version": material})
 
 
-@app.delete("/api/v1/reading/versions/{version_id}", response_model=DeleteOperationResponse)
-def delete_reading_version(version_id: str, principal: AuthPrincipal = Depends(_require_principal)) -> DeleteOperationResponse:
-    deleted_count = reading_store.delete_version(user_id=principal.user_id, version_id=version_id)
+@app.delete(
+    "/api/v1/reading/versions/{version_id}", response_model=DeleteOperationResponse
+)
+def delete_reading_version(
+    version_id: str, principal: AuthPrincipal = Depends(_require_principal)
+) -> DeleteOperationResponse:
+    deleted_count = reading_store.delete_version(
+        user_id=principal.user_id, version_id=version_id
+    )
     if deleted_count <= 0:
         raise HTTPException(status_code=404, detail="Reading version not found")
     return DeleteOperationResponse(status="ok", deleted_count=deleted_count)
 
 
-@app.post("/api/v1/reading/quiz/short-answers/submit", response_model=ReadingShortAnswerSubmitResponse)
+@app.post(
+    "/api/v1/reading/quiz/short-answers/submit",
+    response_model=ReadingShortAnswerSubmitResponse,
+)
 def submit_reading_short_answer(
     payload: ReadingShortAnswerSubmitRequest,
     principal: AuthPrincipal = Depends(_require_principal),
@@ -1334,9 +1756,13 @@ def submit_reading_short_answer(
     safe_version_id = str(payload.version_id or "").strip()
     safe_question_id = str(payload.question_id or "").strip()
     if not safe_version_id or not safe_question_id:
-        raise HTTPException(status_code=400, detail="version_id and question_id are required")
+        raise HTTPException(
+            status_code=400, detail="version_id and question_id are required"
+        )
 
-    version = reading_store.get_version(user_id=principal.user_id, version_id=safe_version_id)
+    version = reading_store.get_version(
+        user_id=principal.user_id, version_id=safe_version_id
+    )
     if not version:
         raise HTTPException(status_code=404, detail="Reading version not found")
 
@@ -1344,8 +1770,12 @@ def submit_reading_short_answer(
     if not question:
         raise HTTPException(status_code=404, detail="Short question not found")
 
-    profile_settings = _normalize_profile_settings_payload(profile_store.get_profile_settings(user_id=principal.user_id))
-    profile_llm_payload = _resolve_profile_llm_payload(profile=profile_settings, scene="reading")
+    profile_settings = _normalize_profile_settings_payload(
+        profile_store.get_profile_settings(user_id=principal.user_id)
+    )
+    profile_llm_payload = _resolve_profile_llm_payload(
+        profile=profile_settings, scene="reading"
+    )
     llm_payload = _build_oneapi_user_llm_payload(
         access_token=principal.access_token,
         raw_llm=profile_llm_payload,
@@ -1358,7 +1788,11 @@ def submit_reading_short_answer(
     )
     llm_usage = {}
     if isinstance(result_payload, dict):
-        llm_usage = result_payload.pop("_llm_usage", {}) if isinstance(result_payload.get("_llm_usage"), dict) else {}
+        llm_usage = (
+            result_payload.pop("_llm_usage", {})
+            if isinstance(result_payload.get("_llm_usage"), dict)
+            else {}
+        )
     saved = reading_store.save_short_answer_attempt(
         user_id=principal.user_id,
         version_id=safe_version_id,
@@ -1388,7 +1822,10 @@ def submit_reading_short_answer(
     return ReadingShortAnswerSubmitResponse.model_validate(saved)
 
 
-@app.get("/api/v1/reading/quiz/short-answers/history", response_model=ReadingShortAnswerHistoryResponse)
+@app.get(
+    "/api/v1/reading/quiz/short-answers/history",
+    response_model=ReadingShortAnswerHistoryResponse,
+)
 def get_reading_short_answer_history(
     version_id: str = "",
     question_id: str = "",
@@ -1408,7 +1845,10 @@ def get_reading_short_answer_history(
     return ReadingShortAnswerHistoryResponse.model_validate({"items": items})
 
 
-@app.delete("/api/v1/reading/quiz/short-answers/history/group", response_model=DeleteOperationResponse)
+@app.delete(
+    "/api/v1/reading/quiz/short-answers/history/group",
+    response_model=DeleteOperationResponse,
+)
 def delete_reading_short_answer_group(
     payload: ReadingShortAnswerHistoryDeleteRequest,
     principal: AuthPrincipal = Depends(_require_principal),
@@ -1433,10 +1873,15 @@ def get_reading_material(
     safe_level = (user_level or "cet4").strip().lower() or "cet4"
     material = None
     if safe_version_id:
-        material = reading_store.get_version(user_id=principal.user_id, version_id=safe_version_id)
+        material = reading_store.get_version(
+            user_id=principal.user_id, version_id=safe_version_id
+        )
     else:
         if not str(video_name or "").strip() or not str(srt_name or "").strip():
-            raise HTTPException(status_code=400, detail="video_name and srt_name are required when version_id is absent")
+            raise HTTPException(
+                status_code=400,
+                detail="video_name and srt_name are required when version_id is absent",
+            )
         material = reading_store.get_material(
             user_id=principal.user_id,
             video_name=video_name,
@@ -1454,7 +1899,11 @@ def generate_reading_material_api(
     payload: ReadingMaterialGenerateRequest,
     principal: AuthPrincipal = Depends(_require_principal),
 ) -> ReadingMaterialResponse:
-    source = reading_store.get_source(user_id=principal.user_id, video_name=payload.video_name, srt_name=payload.srt_name)
+    source = reading_store.get_source(
+        user_id=principal.user_id,
+        video_name=payload.video_name,
+        srt_name=payload.srt_name,
+    )
     if not source:
         raise HTTPException(status_code=404, detail="Reading source not found")
 
@@ -1478,7 +1927,9 @@ def generate_reading_material_api(
             genre=payload.genre,
         )
         if cached:
-            compatible, reason = _is_reading_cache_compatible(material=cached, llm_signature=llm_signature)
+            compatible, reason = _is_reading_cache_compatible(
+                material=cached, llm_signature=llm_signature
+            )
             if compatible:
                 print(
                     f"[DEBUG] Reading material cache hit video={payload.video_name} "
@@ -1517,7 +1968,12 @@ def generate_reading_material_api(
         )
     except ReadingPipelineError as exc:
         code = str(exc.code or "").strip() or "reading_generation_failed"
-        status_code = 502 if code in {"reading_generation_quality_failed", "reading_quiz_generation_failed"} else 500
+        status_code = (
+            502
+            if code
+            in {"reading_generation_quality_failed", "reading_quiz_generation_failed"}
+            else 500
+        )
         raise HTTPException(
             status_code=status_code,
             detail={
@@ -1536,10 +1992,14 @@ def generate_reading_material_api(
             },
         ) from exc
 
-    previous_materials = latest_version.get("materials") if isinstance(latest_version, dict) else []
+    previous_materials = (
+        latest_version.get("materials") if isinstance(latest_version, dict) else []
+    )
     materials_payload = _merge_material_slots(
         generated_materials=generated.materials,
-        previous_materials=previous_materials if isinstance(previous_materials, list) else [],
+        previous_materials=previous_materials
+        if isinstance(previous_materials, list)
+        else [],
     )
     quiz_payload = generated.quiz if isinstance(generated.quiz, dict) else {}
     if payload.scope == "extensive" and isinstance(latest_version, dict):
@@ -1547,7 +2007,9 @@ def generate_reading_material_api(
         if isinstance(previous_quiz, dict):
             quiz_payload = previous_quiz
 
-    config_payload = dict(generated.config if isinstance(generated.config, dict) else {})
+    config_payload = dict(
+        generated.config if isinstance(generated.config, dict) else {}
+    )
     config_payload[READING_CACHE_QUALITY_STRATEGY_KEY] = READING_QUALITY_STRATEGY_TAG
     config_payload[READING_CACHE_QUALITY_RETRY_KEY] = int(READING_QUALITY_RETRY_BUDGET)
     config_payload[READING_CACHE_LLM_SIGNATURE_KEY] = llm_signature
@@ -1603,11 +2065,20 @@ async def create_subtitle_job(
     try:
         raw_options = json.loads(options_json or "{}")
     except json.JSONDecodeError as exc:
-        raise HTTPException(status_code=400, detail=f"Invalid options_json: {exc}") from exc
+        raise HTTPException(
+            status_code=400, detail=f"Invalid options_json: {exc}"
+        ) from exc
 
     options = SubtitleJobOptions.model_validate(raw_options)
     options_dict = _validate_subtitle_job_options(options)
-    options_dict = _inject_job_model_options_from_principal(options=options_dict, principal=principal)
+    options_dict = _inject_job_model_options_from_principal(
+        options=options_dict, principal=principal
+    )
+    try:
+        _ensure_asr_submit_quota(principal=principal, options=options_dict)
+    except HTTPException:
+        await video_file.close()
+        raise
 
     capacity = job_manager.check_submit_capacity(user_id=principal.user_id)
     if not bool(capacity.get("ok")):
@@ -1661,12 +2132,17 @@ def create_subtitle_job_from_url(
             },
         )
     try:
-        safe_url = normalize_source_url(str(policy.get("normalized_url") or payload.url))
+        safe_url = normalize_source_url(
+            str(policy.get("normalized_url") or payload.url)
+        )
     except PipelineError as exc:
         raise HTTPException(status_code=400, detail=exc.message) from exc
 
     options_dict = _validate_subtitle_job_options(payload.options)
-    options_dict = _inject_job_model_options_from_principal(options=options_dict, principal=principal)
+    options_dict = _inject_job_model_options_from_principal(
+        options=options_dict, principal=principal
+    )
+    _ensure_asr_submit_quota(principal=principal, options=options_dict)
 
     capacity = job_manager.check_submit_capacity(user_id=principal.user_id)
     if not bool(capacity.get("ok")):
@@ -1698,26 +2174,36 @@ def create_subtitle_job_from_url(
 
 
 @app.post("/api/v1/subtitle-jobs/resume-llm", response_model=JobCreateResponse)
-def resume_subtitle_job(principal: AuthPrincipal = Depends(_require_principal)) -> JobCreateResponse:
+def resume_subtitle_job(
+    principal: AuthPrincipal = Depends(_require_principal),
+) -> JobCreateResponse:
     _ = principal
     raise HTTPException(status_code=410, detail=_deprecated_simplified_only_detail())
 
 
 @app.post("/api/v1/subtitle-jobs/continue", response_model=JobCreateResponse)
-def continue_subtitle_job(principal: AuthPrincipal = Depends(_require_principal)) -> JobCreateResponse:
+def continue_subtitle_job(
+    principal: AuthPrincipal = Depends(_require_principal),
+) -> JobCreateResponse:
     _ = principal
     raise HTTPException(status_code=410, detail=_deprecated_simplified_only_detail())
 
 
-@app.post("/api/v1/subtitle-jobs/{job_id}/retry-alignment", response_model=JobCreateResponse)
-def retry_subtitle_job_alignment(job_id: str, principal: AuthPrincipal = Depends(_require_principal)) -> JobCreateResponse:
+@app.post(
+    "/api/v1/subtitle-jobs/{job_id}/retry-alignment", response_model=JobCreateResponse
+)
+def retry_subtitle_job_alignment(
+    job_id: str, principal: AuthPrincipal = Depends(_require_principal)
+) -> JobCreateResponse:
     _ = job_id
     _ = principal
     raise HTTPException(status_code=410, detail=_deprecated_simplified_only_detail())
 
 
 @app.get("/api/v1/subtitle-jobs/{job_id}", response_model=JobStatusResponse)
-def get_job_status(job_id: str, principal: AuthPrincipal = Depends(_require_principal)) -> JobStatusResponse:
+def get_job_status(
+    job_id: str, principal: AuthPrincipal = Depends(_require_principal)
+) -> JobStatusResponse:
     record = job_manager.get_status(job_id, user_id=principal.user_id)
     if not record:
         raise HTTPException(status_code=404, detail="Job not found")
@@ -1725,12 +2211,17 @@ def get_job_status(job_id: str, principal: AuthPrincipal = Depends(_require_prin
 
 
 @app.get("/api/v1/subtitle-jobs/{job_id}/result")
-def get_job_result(job_id: str, principal: AuthPrincipal = Depends(_require_principal)) -> dict:
+def get_job_result(
+    job_id: str, principal: AuthPrincipal = Depends(_require_principal)
+) -> dict:
     record = job_manager.get_status(job_id, user_id=principal.user_id)
     if not record:
         raise HTTPException(status_code=404, detail="Job not found")
     if record.status != "completed":
-        raise HTTPException(status_code=409, detail=f"Job not completed yet, current status: {record.status}")
+        raise HTTPException(
+            status_code=409,
+            detail=f"Job not completed yet, current status: {record.status}",
+        )
 
     payload = job_manager.consume_result(job_id, user_id=principal.user_id)
     if not payload:
@@ -1743,7 +2234,9 @@ def get_job_result(job_id: str, principal: AuthPrincipal = Depends(_require_prin
     try:
         _persist_reading_source_from_job_result(record, payload)
     except Exception as exc:
-        print(f"[DEBUG] Failed to persist reading source from job result job_id={job_id}: {exc}")
+        print(
+            f"[DEBUG] Failed to persist reading source from job result job_id={job_id}: {exc}"
+        )
 
     return payload
 
@@ -1756,7 +2249,10 @@ def get_job_video(job_id: str, principal: AuthPrincipal = Depends(_require_princ
     if record.source_mode != "url":
         raise HTTPException(status_code=409, detail="Job is not url source mode")
     if record.status != "completed":
-        raise HTTPException(status_code=409, detail=f"Job not completed yet, current status: {record.status}")
+        raise HTTPException(
+            status_code=409,
+            detail=f"Job not completed yet, current status: {record.status}",
+        )
 
     video_path = Path(record.video_path or "").resolve()
     if not video_path.is_file():
@@ -1775,7 +2271,9 @@ def get_job_video(job_id: str, principal: AuthPrincipal = Depends(_require_princ
 
 
 @app.delete("/api/v1/subtitle-jobs/{job_id}")
-def delete_job(job_id: str, principal: AuthPrincipal = Depends(_require_principal)) -> dict:
+def delete_job(
+    job_id: str, principal: AuthPrincipal = Depends(_require_principal)
+) -> dict:
     payload = job_manager.delete_job(job_id, user_id=principal.user_id)
     if not payload:
         raise HTTPException(status_code=404, detail="Job not found")

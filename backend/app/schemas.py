@@ -39,12 +39,16 @@ class SubtitleJobOptions(BaseModel):
 
     @model_validator(mode="after")
     def normalize_values(self) -> "SubtitleJobOptions":
-        self.asr_profile = (self.asr_profile or "balanced").strip().lower() or "balanced"
+        self.asr_profile = (
+            self.asr_profile or "balanced"
+        ).strip().lower() or "balanced"
         if self.asr_profile not in {"fast", "balanced", "accurate"}:
             self.asr_profile = "balanced"
         self.source_language = (self.source_language or "en").strip() or "en"
         self.target_language = (self.target_language or "zh").strip() or "zh"
-        self.whisper.language = (self.whisper.language or self.source_language).strip() or self.source_language
+        self.whisper.language = (
+            self.whisper.language or self.source_language
+        ).strip() or self.source_language
         return self
 
 
@@ -235,7 +239,13 @@ class SubtitleTaskMeta(BaseModel):
             self.pending_state = "none"  # type: ignore[assignment]
         self.last_job_id = str(self.last_job_id or "").strip()
         last_job_status = str(self.last_job_status or "queued").strip().lower()
-        if last_job_status not in {"queued", "running", "completed", "failed", "cancelled"}:
+        if last_job_status not in {
+            "queued",
+            "running",
+            "completed",
+            "failed",
+            "cancelled",
+        }:
             last_job_status = "queued"
         self.last_job_status = last_job_status  # type: ignore[assignment]
         self.last_stage = str(self.last_stage or "").strip()
@@ -320,7 +330,9 @@ class LlmOptionsUpdate(BaseModel):
 
 
 class ProfileSettings(BaseModel):
-    english_level: Literal["junior", "senior", "cet4", "cet6", "kaoyan", "toefl", "sat"] = Field(default="cet4")
+    english_level: Literal[
+        "junior", "senior", "cet4", "cet6", "kaoyan", "toefl", "sat"
+    ] = Field(default="cet4")
     english_level_numeric: float = Field(default=7.5)
     english_level_cefr: str = Field(default="B1")
     llm_mode: Literal["unified", "custom"] = Field(default="unified")
@@ -332,7 +344,15 @@ class ProfileSettings(BaseModel):
     @model_validator(mode="after")
     def normalize(self) -> "ProfileSettings":
         self.english_level = str(self.english_level or "cet4").strip().lower()  # type: ignore[assignment]
-        if self.english_level not in {"junior", "senior", "cet4", "cet6", "kaoyan", "toefl", "sat"}:
+        if self.english_level not in {
+            "junior",
+            "senior",
+            "cet4",
+            "cet6",
+            "kaoyan",
+            "toefl",
+            "sat",
+        }:
             self.english_level = "cet4"  # type: ignore[assignment]
         self.llm_mode = str(self.llm_mode or "unified").strip().lower()  # type: ignore[assignment]
         if self.llm_mode not in {"unified", "custom"}:
@@ -343,7 +363,9 @@ class ProfileSettings(BaseModel):
 
 
 class ProfileSettingsUpdateRequest(BaseModel):
-    english_level: Optional[Literal["junior", "senior", "cet4", "cet6", "kaoyan", "toefl", "sat"]] = None
+    english_level: Optional[
+        Literal["junior", "senior", "cet4", "cet6", "kaoyan", "toefl", "sat"]
+    ] = None
     llm_mode: Optional[Literal["unified", "custom"]] = None
     llm_unified: Optional[LlmOptionsUpdate] = None
     llm_listening: Optional[LlmOptionsUpdate] = None
@@ -430,6 +452,37 @@ class WalletPacksResponse(BaseModel):
     cost_multiplier: float = 3.0
 
 
+class AsrWalletChargeItem(BaseModel):
+    job_id: str = ""
+    billed_seconds: float = 0.0
+    base_cost_cny: float = 0.0
+    multiplier: float = 0.0
+    billed_cost_cny: float = 0.0
+    billed_quota: int = 0
+    created_at: int = 0
+
+
+class AsrConsoleResponse(BaseModel):
+    route_mode: Literal["dashscope_direct", "oneapi_fallback"] = "oneapi_fallback"
+    route_base_url: str = ""
+    api_key_configured: bool = False
+    api_key_masked: str = ""
+    cost_multiplier: float = 3.0
+    quota_per_cny: int = 100000
+    submit_min_remaining_quota: int = 1
+    user_id: str = ""
+    username: str = ""
+    quota: int = 0
+    used_quota: int = 0
+    remaining_quota: int = 0
+    request_count: int = 0
+    asr_used_quota: int = 0
+    asr_charge_count: int = 0
+    asr_base_cost_cny: float = 0.0
+    asr_billed_cost_cny: float = 0.0
+    charges: list[AsrWalletChargeItem] = Field(default_factory=list)
+
+
 class ReadingChoiceQuestion(BaseModel):
     question_id: str = Field(default="")
     question: str = Field(default="")
@@ -463,7 +516,9 @@ class ReadingDifficultyReport(BaseModel):
     generated_level: float = Field(default=0.0)
     target_level: float = Field(default=0.0)
     gap_to_user: float = Field(default=0.0)
-    recommended_ratio_preset: Literal["high_energy", "long_term", "low_energy"] = Field(default="long_term")
+    recommended_ratio_preset: Literal["high_energy", "long_term", "low_energy"] = Field(
+        default="long_term"
+    )
     hit_i_plus_one: bool = Field(default=False)
     used_cefr_fallback: bool = Field(default=False)
     detail: dict = Field(default_factory=dict)
@@ -471,8 +526,12 @@ class ReadingDifficultyReport(BaseModel):
 
 class ReadingConfigSnapshot(BaseModel):
     scope: Literal["all", "intensive", "extensive"] = Field(default="all")
-    ratio_preset: Literal["high_energy", "long_term", "low_energy"] = Field(default="long_term")
-    difficulty_tier: Literal["very_easy", "easy", "balanced", "challenging", "hard"] = Field(default="balanced")
+    ratio_preset: Literal["high_energy", "long_term", "low_energy"] = Field(
+        default="long_term"
+    )
+    difficulty_tier: Literal["very_easy", "easy", "balanced", "challenging", "hard"] = (
+        Field(default="balanced")
+    )
     genre: Literal["news", "science", "story", "workplace"] = Field(default="news")
     word_budget_total: int = Field(default=0)
 
@@ -483,13 +542,19 @@ class ReadingVersion(BaseModel):
     srt_name: str = Field(default="")
     user_level: str = Field(default="cet4")
     scope: Literal["all", "intensive", "extensive"] = Field(default="all")
-    ratio_preset: Literal["high_energy", "long_term", "low_energy"] = Field(default="long_term")
-    difficulty_tier: Literal["very_easy", "easy", "balanced", "challenging", "hard"] = Field(default="balanced")
+    ratio_preset: Literal["high_energy", "long_term", "low_energy"] = Field(
+        default="long_term"
+    )
+    difficulty_tier: Literal["very_easy", "easy", "balanced", "challenging", "hard"] = (
+        Field(default="balanced")
+    )
     genre: Literal["news", "science", "story", "workplace"] = Field(default="news")
     i_plus_one_hit: bool = Field(default=False)
     pipeline_version: str = Field(default="reading_v2_v2")
     config: ReadingConfigSnapshot = Field(default_factory=ReadingConfigSnapshot)
-    difficulty_report: ReadingDifficultyReport = Field(default_factory=ReadingDifficultyReport)
+    difficulty_report: ReadingDifficultyReport = Field(
+        default_factory=ReadingDifficultyReport
+    )
     materials: list[ReadingMaterialSlot] = Field(default_factory=list)
     quiz: ReadingQuizPayload = Field(default_factory=ReadingQuizPayload)
     created_at: int = Field(default=0)
@@ -501,8 +566,12 @@ class ReadingHistoryItem(BaseModel):
     video_name: str = Field(default="")
     srt_name: str = Field(default="")
     scope: Literal["all", "intensive", "extensive"] = Field(default="all")
-    ratio_preset: Literal["high_energy", "long_term", "low_energy"] = Field(default="long_term")
-    difficulty_tier: Literal["very_easy", "easy", "balanced", "challenging", "hard"] = Field(default="balanced")
+    ratio_preset: Literal["high_energy", "long_term", "low_energy"] = Field(
+        default="long_term"
+    )
+    difficulty_tier: Literal["very_easy", "easy", "balanced", "challenging", "hard"] = (
+        Field(default="balanced")
+    )
     genre: Literal["news", "science", "story", "workplace"] = Field(default="news")
     i_plus_one_hit: bool = Field(default=False)
     created_at: int = Field(default=0)
@@ -529,10 +598,16 @@ class ReadingMaterialResponse(ReadingVersion):
 class ReadingMaterialGenerateRequest(BaseModel):
     video_name: str = Field(default="")
     srt_name: str = Field(default="")
-    user_level: Literal["junior", "senior", "cet4", "cet6", "kaoyan", "toefl", "sat"] = Field(default="cet4")
+    user_level: Literal[
+        "junior", "senior", "cet4", "cet6", "kaoyan", "toefl", "sat"
+    ] = Field(default="cet4")
     scope: Literal["all", "intensive", "extensive"] = Field(default="all")
-    ratio_preset: Literal["high_energy", "long_term", "low_energy"] = Field(default="long_term")
-    difficulty_tier: Literal["very_easy", "easy", "balanced", "challenging", "hard"] = Field(default="balanced")
+    ratio_preset: Literal["high_energy", "long_term", "low_energy"] = Field(
+        default="long_term"
+    )
+    difficulty_tier: Literal["very_easy", "easy", "balanced", "challenging", "hard"] = (
+        Field(default="balanced")
+    )
     genre: Literal["news", "science", "story", "workplace"] = Field(default="news")
     force_regenerate: bool = Field(default=False)
     llm: Optional[LlmOptions] = None
@@ -542,7 +617,15 @@ class ReadingMaterialGenerateRequest(BaseModel):
         self.video_name = (self.video_name or "").strip()
         self.srt_name = (self.srt_name or "").strip()
         self.user_level = str(self.user_level or "cet4").strip().lower()  # type: ignore[assignment]
-        if self.user_level not in {"junior", "senior", "cet4", "cet6", "kaoyan", "toefl", "sat"}:
+        if self.user_level not in {
+            "junior",
+            "senior",
+            "cet4",
+            "cet6",
+            "kaoyan",
+            "toefl",
+            "sat",
+        }:
             self.user_level = "cet4"  # type: ignore[assignment]
         self.scope = str(self.scope or "all").strip().lower()  # type: ignore[assignment]
         if self.scope not in {"all", "intensive", "extensive"}:
@@ -551,7 +634,13 @@ class ReadingMaterialGenerateRequest(BaseModel):
         if self.ratio_preset not in {"high_energy", "long_term", "low_energy"}:
             self.ratio_preset = "long_term"  # type: ignore[assignment]
         self.difficulty_tier = str(self.difficulty_tier or "balanced").strip().lower()  # type: ignore[assignment]
-        if self.difficulty_tier not in {"very_easy", "easy", "balanced", "challenging", "hard"}:
+        if self.difficulty_tier not in {
+            "very_easy",
+            "easy",
+            "balanced",
+            "challenging",
+            "hard",
+        }:
             self.difficulty_tier = "balanced"  # type: ignore[assignment]
         self.genre = str(self.genre or "news").strip().lower()  # type: ignore[assignment]
         if self.genre not in {"news", "science", "story", "workplace"}:

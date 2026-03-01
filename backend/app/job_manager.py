@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import queue
 import sqlite3
 import threading
@@ -13,7 +14,11 @@ from typing import Any
 
 from app.asr_cost_ledger import append_asr_cost_record
 from app.llm_cost_ledger import append_llm_cost_record
-from app.pipeline_runner import run_llm_resume_pipeline, run_subtitle_pipeline, validate_video_file
+from app.pipeline_runner import (
+    run_llm_resume_pipeline,
+    run_subtitle_pipeline,
+    validate_video_file,
+)
 from app.translation_cost_ledger import append_translation_cost_record
 from app.url_ingest import download_video_from_url
 from vendor.videolingo_subtitle_core.engine import PipelineError, safe_rmtree
@@ -108,7 +113,9 @@ def _build_partial_result(work_dir: str) -> dict | None:
         return None
 
     word_payload = _load_json(log_dir / "word_segments.json")
-    word_segments = word_payload.get("word_segments") if isinstance(word_payload, dict) else None
+    word_segments = (
+        word_payload.get("word_segments") if isinstance(word_payload, dict) else None
+    )
     if not isinstance(word_segments, list):
         word_segments = []
 
@@ -122,11 +129,15 @@ def _build_partial_result(work_dir: str) -> dict | None:
             "partial_source": source,
         },
     }
-    print(f"[DEBUG] Built partial subtitle result from {source} ({len(subtitles)} items).")
+    print(
+        f"[DEBUG] Built partial subtitle result from {source} ({len(subtitles)} items)."
+    )
     return result
 
 
-def _build_partial_from_sentences(sentences: list[dict], word_segments: list[dict]) -> dict | None:
+def _build_partial_from_sentences(
+    sentences: list[dict], word_segments: list[dict]
+) -> dict | None:
     subtitles: list[dict] = []
     for item in sentences or []:
         if not isinstance(item, dict):
@@ -172,6 +183,8 @@ def _build_partial_from_sentences(sentences: list[dict], word_segments: list[dic
 _RECENT_PROGRESS_EVENT_LIMIT = 30
 _RECENT_PROGRESS_EVENT_RETURN_LIMIT = 12
 _POLL_INTERVAL_MS_HINT = 800
+_DEFAULT_ASR_WALLET_COST_MULTIPLIER = 3.0
+_DEFAULT_WALLET_QUOTA_PER_CNY = 100000
 
 
 @dataclass
@@ -223,6 +236,8 @@ class SubtitleJobManager:
         db_path: str,
         global_concurrency_limit: int = 3,
         per_user_concurrency_limit: int = 1,
+        asr_wallet_cost_multiplier: float = _DEFAULT_ASR_WALLET_COST_MULTIPLIER,
+        wallet_quota_per_cny: int = _DEFAULT_WALLET_QUOTA_PER_CNY,
     ):
         self.runtime_root = Path(runtime_root)
         self.runtime_root.mkdir(parents=True, exist_ok=True)
@@ -230,6 +245,12 @@ class SubtitleJobManager:
         self._db_path.parent.mkdir(parents=True, exist_ok=True)
         self._global_concurrency_limit = max(1, int(global_concurrency_limit or 1))
         self._per_user_concurrency_limit = max(1, int(per_user_concurrency_limit or 1))
+        self._asr_wallet_cost_multiplier = max(
+            0.0, float(asr_wallet_cost_multiplier or 0.0)
+        )
+        self._wallet_quota_per_cny = max(
+            1, int(wallet_quota_per_cny or _DEFAULT_WALLET_QUOTA_PER_CNY)
+        )
         self._jobs: dict[str, JobRecord] = {}
         self._queue: queue.Queue[str] = queue.Queue()
         self._lock = threading.RLock()
@@ -242,7 +263,9 @@ class SubtitleJobManager:
             self._ensure_worker_alive_locked()
 
     def _connect(self) -> sqlite3.Connection:
-        connection = sqlite3.connect(str(self._db_path), timeout=30, check_same_thread=False)
+        connection = sqlite3.connect(
+            str(self._db_path), timeout=30, check_same_thread=False
+        )
         connection.row_factory = sqlite3.Row
         return connection
 
@@ -262,6 +285,23 @@ class SubtitleJobManager:
             connection.execute(
                 "CREATE INDEX IF NOT EXISTS idx_subtitle_jobs_user_updated ON subtitle_jobs(user_id, updated_at DESC)"
             )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS subtitle_asr_wallet_usage (
+                    job_id TEXT PRIMARY KEY,
+                    user_id TEXT NOT NULL,
+                    billed_seconds REAL NOT NULL DEFAULT 0,
+                    base_cost_cny REAL NOT NULL DEFAULT 0,
+                    multiplier REAL NOT NULL DEFAULT 1,
+                    billed_cost_cny REAL NOT NULL DEFAULT 0,
+                    billed_quota INTEGER NOT NULL DEFAULT 0,
+                    created_at INTEGER NOT NULL DEFAULT 0
+                )
+                """
+            )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS idx_subtitle_asr_wallet_usage_user_created ON subtitle_asr_wallet_usage(user_id, created_at DESC)"
+            )
             connection.commit()
 
     def _record_to_persistence_payload(self, record: JobRecord) -> dict[str, Any]:
@@ -274,35 +314,53 @@ class SubtitleJobManager:
             "job_kind": record.job_kind,
             "source_mode": record.source_mode,
             "source_url": record.source_url,
-            "resume_sentences": record.resume_sentences if isinstance(record.resume_sentences, list) else [],
-            "resume_word_segments": record.resume_word_segments if isinstance(record.resume_word_segments, list) else [],
+            "resume_sentences": record.resume_sentences
+            if isinstance(record.resume_sentences, list)
+            else [],
+            "resume_word_segments": record.resume_word_segments
+            if isinstance(record.resume_word_segments, list)
+            else [],
             "status": record.status,
             "progress_percent": int(record.progress_percent or 0),
             "current_stage": record.current_stage,
             "message": record.message,
             "error": record.error,
             "error_code": record.error_code,
-            "error_detail": record.error_detail if isinstance(record.error_detail, dict) else None,
+            "error_detail": record.error_detail
+            if isinstance(record.error_detail, dict)
+            else None,
             "created_at_ms": _to_ms(record.created_at),
             "started_at_ms": _to_ms(record.started_at),
             "updated_at_ms": _to_ms(record.updated_at),
             "completed_at_ms": _to_ms(record.completed_at),
             "result": record.result if isinstance(record.result, dict) else None,
             "result_consumed": bool(record.result_consumed),
-            "partial_result": record.partial_result if isinstance(record.partial_result, dict) else None,
+            "partial_result": record.partial_result
+            if isinstance(record.partial_result, dict)
+            else None,
             "cancel_requested": bool(record.cancel_requested),
             "whisper_runtime": record.whisper_runtime,
             "whisper_model_requested": record.whisper_model_requested,
             "whisper_model_effective": record.whisper_model_effective,
             "asr_provider_effective": record.asr_provider_effective,
             "asr_fallback_used": bool(record.asr_fallback_used),
-            "stage_durations_ms": record.stage_durations_ms if isinstance(record.stage_durations_ms, dict) else {},
-            "stage_order": record.stage_order if isinstance(record.stage_order, list) else [],
+            "stage_durations_ms": record.stage_durations_ms
+            if isinstance(record.stage_durations_ms, dict)
+            else {},
+            "stage_order": record.stage_order
+            if isinstance(record.stage_order, list)
+            else [],
             "stage_started_at_ms": _to_ms(record.stage_started_at),
-            "stage_detail": record.stage_detail if isinstance(record.stage_detail, dict) else {},
-            "recent_progress_events": record.recent_progress_events if isinstance(record.recent_progress_events, list) else [],
+            "stage_detail": record.stage_detail
+            if isinstance(record.stage_detail, dict)
+            else {},
+            "recent_progress_events": record.recent_progress_events
+            if isinstance(record.recent_progress_events, list)
+            else [],
             "status_revision": int(record.status_revision or 0),
-            "sync_diagnostics": record.sync_diagnostics if isinstance(record.sync_diagnostics, dict) else {},
+            "sync_diagnostics": record.sync_diagnostics
+            if isinstance(record.sync_diagnostics, dict)
+            else {},
         }
 
     @staticmethod
@@ -327,47 +385,73 @@ class SubtitleJobManager:
             user_id=user_id,
             work_dir=work_dir,
             video_path=str(payload.get("video_path") or ""),
-            options=payload.get("options") if isinstance(payload.get("options"), dict) else {},
+            options=payload.get("options")
+            if isinstance(payload.get("options"), dict)
+            else {},
             job_kind=str(payload.get("job_kind") or "full"),
             source_mode=str(payload.get("source_mode") or "file"),
             source_url=str(payload.get("source_url") or ""),
-            resume_sentences=payload.get("resume_sentences") if isinstance(payload.get("resume_sentences"), list) else [],
+            resume_sentences=payload.get("resume_sentences")
+            if isinstance(payload.get("resume_sentences"), list)
+            else [],
             resume_word_segments=(
-                payload.get("resume_word_segments") if isinstance(payload.get("resume_word_segments"), list) else []
+                payload.get("resume_word_segments")
+                if isinstance(payload.get("resume_word_segments"), list)
+                else []
             ),
             status=status,
-            progress_percent=max(0, min(100, int(payload.get("progress_percent") or 0))),
+            progress_percent=max(
+                0, min(100, int(payload.get("progress_percent") or 0))
+            ),
             current_stage=str(payload.get("current_stage") or "queued"),
             message=str(payload.get("message") or ""),
             error=str(payload.get("error") or "").strip() or None,
             error_code=str(payload.get("error_code") or ""),
-            error_detail=payload.get("error_detail") if isinstance(payload.get("error_detail"), dict) else None,
+            error_detail=payload.get("error_detail")
+            if isinstance(payload.get("error_detail"), dict)
+            else None,
             created_at=created_at,
             started_at=_from_ms(payload.get("started_at_ms")),
             updated_at=updated_at,
             completed_at=_from_ms(payload.get("completed_at_ms")),
-            result=payload.get("result") if isinstance(payload.get("result"), dict) else None,
+            result=payload.get("result")
+            if isinstance(payload.get("result"), dict)
+            else None,
             result_consumed=bool(payload.get("result_consumed")),
-            partial_result=payload.get("partial_result") if isinstance(payload.get("partial_result"), dict) else None,
+            partial_result=payload.get("partial_result")
+            if isinstance(payload.get("partial_result"), dict)
+            else None,
             cancel_requested=bool(payload.get("cancel_requested")),
             whisper_runtime=str(payload.get("whisper_runtime") or ""),
             whisper_model_requested=str(payload.get("whisper_model_requested") or ""),
             whisper_model_effective=str(payload.get("whisper_model_effective") or ""),
             asr_provider_effective=str(payload.get("asr_provider_effective") or ""),
             asr_fallback_used=bool(payload.get("asr_fallback_used")),
-            stage_durations_ms=payload.get("stage_durations_ms") if isinstance(payload.get("stage_durations_ms"), dict) else {},
-            stage_order=payload.get("stage_order") if isinstance(payload.get("stage_order"), list) else [],
+            stage_durations_ms=payload.get("stage_durations_ms")
+            if isinstance(payload.get("stage_durations_ms"), dict)
+            else {},
+            stage_order=payload.get("stage_order")
+            if isinstance(payload.get("stage_order"), list)
+            else [],
             stage_started_at=_from_ms(payload.get("stage_started_at_ms")),
-            stage_detail=payload.get("stage_detail") if isinstance(payload.get("stage_detail"), dict) else {},
+            stage_detail=payload.get("stage_detail")
+            if isinstance(payload.get("stage_detail"), dict)
+            else {},
             recent_progress_events=(
-                payload.get("recent_progress_events") if isinstance(payload.get("recent_progress_events"), list) else []
+                payload.get("recent_progress_events")
+                if isinstance(payload.get("recent_progress_events"), list)
+                else []
             ),
             status_revision=max(0, int(payload.get("status_revision") or 0)),
-            sync_diagnostics=payload.get("sync_diagnostics") if isinstance(payload.get("sync_diagnostics"), dict) else {},
+            sync_diagnostics=payload.get("sync_diagnostics")
+            if isinstance(payload.get("sync_diagnostics"), dict)
+            else {},
         )
 
     def _persist_record_locked(self, record: JobRecord) -> None:
-        payload_json = json.dumps(self._record_to_persistence_payload(record), ensure_ascii=False)
+        payload_json = json.dumps(
+            self._record_to_persistence_payload(record), ensure_ascii=False
+        )
         now_ms = _to_ms(_now())
         with self._connect() as connection:
             connection.execute(
@@ -396,7 +480,9 @@ class SubtitleJobManager:
 
     def _load_jobs_from_db_locked(self) -> None:
         with self._connect() as connection:
-            rows = connection.execute("SELECT payload_json FROM subtitle_jobs ORDER BY updated_at DESC").fetchall()
+            rows = connection.execute(
+                "SELECT payload_json FROM subtitle_jobs ORDER BY updated_at DESC"
+            ).fetchall()
         for row in rows:
             try:
                 payload = json.loads(str(row["payload_json"] or "{}"))
@@ -410,7 +496,11 @@ class SubtitleJobManager:
 
     def _start_worker_locked(self) -> None:
         worker_index = len(self._workers) + 1
-        thread = threading.Thread(target=self._worker_loop, daemon=True, name=f"subtitle-job-worker-{worker_index}")
+        thread = threading.Thread(
+            target=self._worker_loop,
+            daemon=True,
+            name=f"subtitle-job-worker-{worker_index}",
+        )
         thread.start()
         self._workers.append(thread)
 
@@ -424,6 +514,180 @@ class SubtitleJobManager:
     def _normalize_user_id(user_id: str | None) -> str:
         safe = str(user_id or "").strip()
         return safe or "legacy"
+
+    @staticmethod
+    def _safe_non_negative_float(value: Any, default: float = 0.0) -> float:
+        try:
+            parsed = float(value)
+        except Exception:
+            return default
+        if not math.isfinite(parsed) or parsed < 0:
+            return default
+        return parsed
+
+    def _append_asr_wallet_charge_from_cost_row(
+        self,
+        *,
+        record: JobRecord,
+        asr_cost_row: dict[str, str] | None,
+    ) -> dict[str, Any] | None:
+        if not isinstance(asr_cost_row, dict):
+            return None
+        if self._asr_wallet_cost_multiplier <= 0:
+            return None
+
+        safe_job_id = str(record.job_id or "").strip()
+        if not safe_job_id:
+            return None
+        safe_user_id = self._normalize_user_id(record.user_id)
+
+        billed_seconds = self._safe_non_negative_float(
+            asr_cost_row.get("billed_seconds"), default=0.0
+        )
+        base_cost_cny = self._safe_non_negative_float(
+            asr_cost_row.get("cost_cny"), default=0.0
+        )
+        billed_cost_cny = max(0.0, base_cost_cny * self._asr_wallet_cost_multiplier)
+        billed_quota = max(
+            0, int(round(billed_cost_cny * float(self._wallet_quota_per_cny)))
+        )
+        if billed_cost_cny > 0 and billed_quota <= 0:
+            billed_quota = 1
+
+        created_at_ms = _to_ms(_now())
+        with self._connect() as connection:
+            existing = connection.execute(
+                "SELECT job_id FROM subtitle_asr_wallet_usage WHERE job_id=? LIMIT 1",
+                (safe_job_id,),
+            ).fetchone()
+            if existing is not None:
+                print(f"[DEBUG] Skip duplicate ASR wallet charge job_id={safe_job_id}")
+                return None
+            connection.execute(
+                """
+                INSERT INTO subtitle_asr_wallet_usage(
+                    job_id,
+                    user_id,
+                    billed_seconds,
+                    base_cost_cny,
+                    multiplier,
+                    billed_cost_cny,
+                    billed_quota,
+                    created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    safe_job_id,
+                    safe_user_id,
+                    billed_seconds,
+                    base_cost_cny,
+                    self._asr_wallet_cost_multiplier,
+                    billed_cost_cny,
+                    billed_quota,
+                    created_at_ms,
+                ),
+            )
+            connection.commit()
+
+        print(
+            f"[DEBUG] ASR wallet charge appended "
+            f"job_id={safe_job_id} user_id={safe_user_id} "
+            f"base_cost_cny={base_cost_cny:.8f} multiplier={self._asr_wallet_cost_multiplier:.4f} "
+            f"billed_quota={billed_quota}"
+        )
+        return {
+            "job_id": safe_job_id,
+            "user_id": safe_user_id,
+            "billed_seconds": billed_seconds,
+            "base_cost_cny": base_cost_cny,
+            "billed_quota": billed_quota,
+        }
+
+    def get_user_asr_wallet_usage(self, *, user_id: str) -> dict[str, Any]:
+        safe_user_id = self._normalize_user_id(user_id)
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT
+                    COALESCE(SUM(billed_quota), 0) AS total_billed_quota,
+                    COALESCE(SUM(base_cost_cny), 0) AS total_base_cost_cny,
+                    COALESCE(SUM(billed_cost_cny), 0) AS total_billed_cost_cny,
+                    COUNT(1) AS charge_count
+                FROM subtitle_asr_wallet_usage
+                WHERE user_id=?
+                """,
+                (safe_user_id,),
+            ).fetchone()
+        if row is None:
+            return {
+                "user_id": safe_user_id,
+                "billed_quota": 0,
+                "base_cost_cny": 0.0,
+                "billed_cost_cny": 0.0,
+                "charge_count": 0,
+            }
+        return {
+            "user_id": safe_user_id,
+            "billed_quota": max(0, int(row["total_billed_quota"] or 0)),
+            "base_cost_cny": self._safe_non_negative_float(
+                row["total_base_cost_cny"], default=0.0
+            ),
+            "billed_cost_cny": self._safe_non_negative_float(
+                row["total_billed_cost_cny"], default=0.0
+            ),
+            "charge_count": max(0, int(row["charge_count"] or 0)),
+        }
+
+    def list_user_asr_wallet_charges(
+        self,
+        *,
+        user_id: str,
+        limit: int = 20,
+    ) -> list[dict[str, Any]]:
+        safe_user_id = self._normalize_user_id(user_id)
+        safe_limit = max(1, min(200, int(limit or 20)))
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT
+                    job_id,
+                    user_id,
+                    billed_seconds,
+                    base_cost_cny,
+                    multiplier,
+                    billed_cost_cny,
+                    billed_quota,
+                    created_at
+                FROM subtitle_asr_wallet_usage
+                WHERE user_id=?
+                ORDER BY created_at DESC
+                LIMIT ?
+                """,
+                (safe_user_id, safe_limit),
+            ).fetchall()
+        result: list[dict[str, Any]] = []
+        for row in rows:
+            result.append(
+                {
+                    "job_id": str(row["job_id"] or ""),
+                    "user_id": str(row["user_id"] or safe_user_id),
+                    "billed_seconds": self._safe_non_negative_float(
+                        row["billed_seconds"], default=0.0
+                    ),
+                    "base_cost_cny": self._safe_non_negative_float(
+                        row["base_cost_cny"], default=0.0
+                    ),
+                    "multiplier": self._safe_non_negative_float(
+                        row["multiplier"], default=0.0
+                    ),
+                    "billed_cost_cny": self._safe_non_negative_float(
+                        row["billed_cost_cny"], default=0.0
+                    ),
+                    "billed_quota": max(0, int(row["billed_quota"] or 0)),
+                    "created_at": max(0, int(row["created_at"] or 0)),
+                }
+            )
+        return result
 
     def _can_start_job_locked(self, record: JobRecord) -> bool:
         if self._active_jobs_total >= self._global_concurrency_limit:
@@ -445,17 +709,27 @@ class SubtitleJobManager:
         record.stage_durations_ms.setdefault(safe_stage, 0)
         return safe_stage
 
-    def _close_active_stage_locked(self, record: JobRecord, now: datetime | None = None) -> None:
+    def _close_active_stage_locked(
+        self, record: JobRecord, now: datetime | None = None
+    ) -> None:
         if record.stage_started_at is None:
             return
-        current_stage = self._ensure_stage_entry_locked(record, record.current_stage or "queued")
+        current_stage = self._ensure_stage_entry_locked(
+            record, record.current_stage or "queued"
+        )
         safe_now = now or _now()
-        elapsed_ms = max(0, int(round((safe_now - record.stage_started_at).total_seconds() * 1000)))
+        elapsed_ms = max(
+            0, int(round((safe_now - record.stage_started_at).total_seconds() * 1000))
+        )
         if elapsed_ms > 0:
-            record.stage_durations_ms[current_stage] = int(record.stage_durations_ms.get(current_stage, 0)) + elapsed_ms
+            record.stage_durations_ms[current_stage] = (
+                int(record.stage_durations_ms.get(current_stage, 0)) + elapsed_ms
+            )
         record.stage_started_at = safe_now
 
-    def _transition_stage_locked(self, record: JobRecord, next_stage: str, now: datetime | None = None) -> None:
+    def _transition_stage_locked(
+        self, record: JobRecord, next_stage: str, now: datetime | None = None
+    ) -> None:
         safe_now = now or _now()
         safe_next = self._normalize_stage(next_stage)
         safe_current = self._normalize_stage(record.current_stage, fallback=safe_next)
@@ -464,14 +738,18 @@ class SubtitleJobManager:
             record.current_stage = safe_next
             self._ensure_stage_entry_locked(record, safe_next)
             record.stage_started_at = safe_now
-            print(f"[DEBUG] Job {record.job_id} stage transition: {safe_current} -> {safe_next}")
+            print(
+                f"[DEBUG] Job {record.job_id} stage transition: {safe_current} -> {safe_next}"
+            )
             return
         record.current_stage = safe_current
         self._ensure_stage_entry_locked(record, safe_current)
         if record.stage_started_at is None:
             record.stage_started_at = safe_now
 
-    def _finalize_stage_tracking_locked(self, record: JobRecord, now: datetime | None = None) -> None:
+    def _finalize_stage_tracking_locked(
+        self, record: JobRecord, now: datetime | None = None
+    ) -> None:
         safe_now = now or _now()
         self._close_active_stage_locked(record, safe_now)
         record.stage_started_at = None
@@ -506,7 +784,9 @@ class SubtitleJobManager:
         record.status_revision = 1
 
     @staticmethod
-    def _sanitize_detail_payload(detail: dict[str, Any] | None) -> dict[str, Any] | None:
+    def _sanitize_detail_payload(
+        detail: dict[str, Any] | None,
+    ) -> dict[str, Any] | None:
         if not isinstance(detail, dict):
             return None
         payload: dict[str, Any] = {}
@@ -529,7 +809,9 @@ class SubtitleJobManager:
                 parsed = max(0, parsed)
             payload[key] = parsed
         if "percent_in_stage" in payload and payload["percent_in_stage"] is not None:
-            payload["percent_in_stage"] = max(0, min(100, int(payload["percent_in_stage"])))
+            payload["percent_in_stage"] = max(
+                0, min(100, int(payload["percent_in_stage"]))
+            )
         return payload or None
 
     @staticmethod
@@ -551,7 +833,9 @@ class SubtitleJobManager:
             "correction_method": "none",
         }
         try:
-            result["alignment_quality_score"] = float(payload.get("alignment_quality_score") or 0.0)
+            result["alignment_quality_score"] = float(
+                payload.get("alignment_quality_score") or 0.0
+            )
         except Exception:
             pass
         try:
@@ -569,7 +853,9 @@ class SubtitleJobManager:
             result["triggered"] = bool(payload.get("triggered"))
         if "correction_score" in payload:
             try:
-                result["correction_score"] = float(payload.get("correction_score") or 0.0)
+                result["correction_score"] = float(
+                    payload.get("correction_score") or 0.0
+                )
             except Exception:
                 result["correction_score"] = 0.0
         return result
@@ -583,7 +869,9 @@ class SubtitleJobManager:
             return SubtitleJobManager._safe_sync_diagnostics(direct)
         stats = result.get("stats")
         if isinstance(stats, dict) and isinstance(stats.get("sync_diagnostics"), dict):
-            return SubtitleJobManager._safe_sync_diagnostics(stats.get("sync_diagnostics"))
+            return SubtitleJobManager._safe_sync_diagnostics(
+                stats.get("sync_diagnostics")
+            )
         return {}
 
     @staticmethod
@@ -597,22 +885,25 @@ class SubtitleJobManager:
         return model == "qwen-mt-flash"
 
     @classmethod
-    def _map_stage_for_display(cls, stage: Any, *, translation_model_requested: bool) -> str:
+    def _map_stage_for_display(
+        cls, stage: Any, *, translation_model_requested: bool
+    ) -> str:
         safe_stage = cls._normalize_stage(str(stage or ""))
         if translation_model_requested and safe_stage == "llm_translate":
             return "translate_chunks"
         return safe_stage
 
     @staticmethod
-    def _map_message_for_display(message: Any, *, translation_model_requested: bool) -> str:
+    def _map_message_for_display(
+        message: Any, *, translation_model_requested: bool
+    ) -> str:
         safe_message = str(message or "")
         if not translation_model_requested:
             return safe_message
         if "直译" not in safe_message:
             return safe_message
         normalized = (
-            safe_message
-            .replace("正在执行 LLM 直译", "正在执行翻译模型直译")
+            safe_message.replace("正在执行 LLM 直译", "正在执行翻译模型直译")
             .replace("正在执行 LLM直译", "正在执行翻译模型直译")
             .replace("LLM 直译", "翻译模型直译")
             .replace("LLM直译", "翻译模型直译")
@@ -641,7 +932,9 @@ class SubtitleJobManager:
             "done": max(0, int(payload.get("done") or 0)),
             "total": max(0, int(payload.get("total") or 0)),
             "unit": str(payload.get("unit") or "").strip(),
-            "percent_in_stage": max(0, min(100, int(payload.get("percent_in_stage") or 0))),
+            "percent_in_stage": max(
+                0, min(100, int(payload.get("percent_in_stage") or 0))
+            ),
             "eta_seconds": (
                 None
                 if payload.get("eta_seconds") is None
@@ -689,7 +982,9 @@ class SubtitleJobManager:
             }
         )
         if len(record.recent_progress_events) > _RECENT_PROGRESS_EVENT_LIMIT:
-            record.recent_progress_events = record.recent_progress_events[-_RECENT_PROGRESS_EVENT_LIMIT:]
+            record.recent_progress_events = record.recent_progress_events[
+                -_RECENT_PROGRESS_EVENT_LIMIT:
+            ]
 
     def create_job(
         self,
@@ -713,13 +1008,24 @@ class SubtitleJobManager:
             job_kind="full",
             source_mode="file",
             message="任务已排队",
-            whisper_runtime=str(((options or {}).get("whisper") or {}).get("runtime") or "cloud").strip().lower() or "cloud",
+            whisper_runtime=str(
+                ((options or {}).get("whisper") or {}).get("runtime") or "cloud"
+            )
+            .strip()
+            .lower()
+            or "cloud",
             whisper_model_requested=(
-                str(((options or {}).get("whisper") or {}).get("model") or "paraformer-v2").strip()
+                str(
+                    ((options or {}).get("whisper") or {}).get("model")
+                    or "paraformer-v2"
+                ).strip()
                 or "paraformer-v2"
             ),
             whisper_model_effective=(
-                str(((options or {}).get("whisper") or {}).get("model") or "paraformer-v2").strip()
+                str(
+                    ((options or {}).get("whisper") or {}).get("model")
+                    or "paraformer-v2"
+                ).strip()
                 or "paraformer-v2"
             ),
         )
@@ -755,13 +1061,24 @@ class SubtitleJobManager:
             options=options,
             job_kind="url",
             message="任务已排队",
-            whisper_runtime=str(((options or {}).get("whisper") or {}).get("runtime") or "cloud").strip().lower() or "cloud",
+            whisper_runtime=str(
+                ((options or {}).get("whisper") or {}).get("runtime") or "cloud"
+            )
+            .strip()
+            .lower()
+            or "cloud",
             whisper_model_requested=(
-                str(((options or {}).get("whisper") or {}).get("model") or "paraformer-v2").strip()
+                str(
+                    ((options or {}).get("whisper") or {}).get("model")
+                    or "paraformer-v2"
+                ).strip()
                 or "paraformer-v2"
             ),
             whisper_model_effective=(
-                str(((options or {}).get("whisper") or {}).get("model") or "paraformer-v2").strip()
+                str(
+                    ((options or {}).get("whisper") or {}).get("model")
+                    or "paraformer-v2"
+                ).strip()
                 or "paraformer-v2"
             ),
         )
@@ -799,13 +1116,24 @@ class SubtitleJobManager:
             resume_sentences=sentences or [],
             resume_word_segments=word_segments or [],
             message="任务已排队",
-            whisper_runtime=str(((options or {}).get("whisper") or {}).get("runtime") or "cloud").strip().lower() or "cloud",
+            whisper_runtime=str(
+                ((options or {}).get("whisper") or {}).get("runtime") or "cloud"
+            )
+            .strip()
+            .lower()
+            or "cloud",
             whisper_model_requested=(
-                str(((options or {}).get("whisper") or {}).get("model") or "paraformer-v2").strip()
+                str(
+                    ((options or {}).get("whisper") or {}).get("model")
+                    or "paraformer-v2"
+                ).strip()
                 or "paraformer-v2"
             ),
             whisper_model_effective=(
-                str(((options or {}).get("whisper") or {}).get("model") or "paraformer-v2").strip()
+                str(
+                    ((options or {}).get("whisper") or {}).get("model")
+                    or "paraformer-v2"
+                ).strip()
                 or "paraformer-v2"
             ),
         )
@@ -828,7 +1156,9 @@ class SubtitleJobManager:
                 return
             self._queue.put(job_id)
 
-    def get_status(self, job_id: str, *, user_id: str | None = None) -> JobRecord | None:
+    def get_status(
+        self, job_id: str, *, user_id: str | None = None
+    ) -> JobRecord | None:
         safe_user_id = self._normalize_user_id(user_id)
         with self._lock:
             self._ensure_worker_alive_locked()
@@ -863,23 +1193,32 @@ class SubtitleJobManager:
             self._ensure_worker_alive_locked()
             self._cleanup_expired_locked()
             active_records = [
-                item for item in self._jobs.values()
+                item
+                for item in self._jobs.values()
                 if item.status in ("queued", "running")
                 and (user_id is None or item.user_id == safe_user_id)
             ]
             if not active_records:
                 return None
-            return sorted(active_records, key=lambda item: item.created_at, reverse=True)[0]
+            return sorted(
+                active_records, key=lambda item: item.created_at, reverse=True
+            )[0]
 
     def check_submit_capacity(self, *, user_id: str) -> dict[str, Any]:
         safe_user_id = self._normalize_user_id(user_id)
         with self._lock:
             self._ensure_worker_alive_locked()
             self._cleanup_expired_locked()
-            active = [item for item in self._jobs.values() if item.status in ("queued", "running")]
+            active = [
+                item
+                for item in self._jobs.values()
+                if item.status in ("queued", "running")
+            ]
             user_active = [item for item in active if item.user_id == safe_user_id]
             if len(user_active) >= self._per_user_concurrency_limit:
-                latest = sorted(user_active, key=lambda item: item.created_at, reverse=True)[0]
+                latest = sorted(
+                    user_active, key=lambda item: item.created_at, reverse=True
+                )[0]
                 return {
                     "ok": False,
                     "code": "user_concurrency_limit",
@@ -900,7 +1239,9 @@ class SubtitleJobManager:
                 "user_active_count": len(user_active),
             }
 
-    def delete_job(self, job_id: str, *, user_id: str | None = None) -> dict[str, Any] | None:
+    def delete_job(
+        self, job_id: str, *, user_id: str | None = None
+    ) -> dict[str, Any] | None:
         safe_user_id = self._normalize_user_id(user_id)
         with self._lock:
             self._ensure_worker_alive_locked()
@@ -919,7 +1260,11 @@ class SubtitleJobManager:
                     record,
                     stage="cancelling",
                     now=now,
-                    detail={"step_key": "cancelling", "step_label": "正在取消", "percent_in_stage": 100},
+                    detail={
+                        "step_key": "cancelling",
+                        "step_label": "正在取消",
+                        "percent_in_stage": 100,
+                    },
                 )
                 self._append_progress_event_locked(
                     record,
@@ -931,12 +1276,18 @@ class SubtitleJobManager:
                 )
                 self._bump_status_revision_locked(record)
                 self._persist_record_locked(record)
-                return {"job_id": job_id, "status": "cancel_requested", "cancel_requested": True}
+                return {
+                    "job_id": job_id,
+                    "status": "cancel_requested",
+                    "cancel_requested": True,
+                }
             if record.status == "queued":
                 now = _now()
                 record.status = "cancelled"
                 record.cancel_requested = False
-                record.progress_percent = max(0, min(100, int(record.progress_percent or 0)))
+                record.progress_percent = max(
+                    0, min(100, int(record.progress_percent or 0))
+                )
                 self._transition_stage_locked(record, "cancelled", now=now)
                 record.message = "任务已取消"
                 record.completed_at = now
@@ -945,7 +1296,11 @@ class SubtitleJobManager:
                     record,
                     stage="cancelled",
                     now=now,
-                    detail={"step_key": "cancelled", "step_label": "任务已取消", "percent_in_stage": 100},
+                    detail={
+                        "step_key": "cancelled",
+                        "step_label": "任务已取消",
+                        "percent_in_stage": 100,
+                    },
                 )
                 self._append_progress_event_locked(
                     record,
@@ -958,7 +1313,11 @@ class SubtitleJobManager:
                 self._bump_status_revision_locked(record)
                 self._finalize_stage_tracking_locked(record, now=now)
                 self._persist_record_locked(record)
-                return {"job_id": job_id, "status": "cancelled", "cancel_requested": False}
+                return {
+                    "job_id": job_id,
+                    "status": "cancelled",
+                    "cancel_requested": False,
+                }
             safe_rmtree(record.work_dir)
             self._jobs.pop(job_id, None)
             self._delete_record_locked(job_id=job_id)
@@ -975,8 +1334,13 @@ class SubtitleJobManager:
         recent_progress_events: list[dict[str, Any]] = []
         status_revision = 0
         sync_diagnostics: dict[str, Any] = {}
-        translation_model_requested = self._is_translation_model_requested(record.options)
-        current_stage = self._map_stage_for_display(record.current_stage, translation_model_requested=translation_model_requested)
+        translation_model_requested = self._is_translation_model_requested(
+            record.options
+        )
+        current_stage = self._map_stage_for_display(
+            record.current_stage,
+            translation_model_requested=translation_model_requested,
+        )
         with self._lock:
             self._ensure_worker_alive_locked()
             worker_alive = any(worker.is_alive() for worker in self._workers)
@@ -993,7 +1357,9 @@ class SubtitleJobManager:
                     message = "任务即将开始"
             seen: set[str] = set()
             for raw_stage in record.stage_order:
-                safe_stage = self._map_stage_for_display(raw_stage, translation_model_requested=translation_model_requested)
+                safe_stage = self._map_stage_for_display(
+                    raw_stage, translation_model_requested=translation_model_requested
+                )
                 if safe_stage in seen:
                     continue
                 seen.add(safe_stage)
@@ -1003,16 +1369,37 @@ class SubtitleJobManager:
                 stage_order.append(current_stage)
             stage_durations_ms = {}
             for stage, duration_ms in (record.stage_durations_ms or {}).items():
-                safe_stage = self._map_stage_for_display(stage, translation_model_requested=translation_model_requested)
-                stage_durations_ms[safe_stage] = stage_durations_ms.get(safe_stage, 0) + max(0, int(duration_ms or 0))
+                safe_stage = self._map_stage_for_display(
+                    stage, translation_model_requested=translation_model_requested
+                )
+                stage_durations_ms[safe_stage] = stage_durations_ms.get(
+                    safe_stage, 0
+                ) + max(0, int(duration_ms or 0))
             for stage in stage_order:
                 stage_durations_ms.setdefault(stage, 0)
-            if record.stage_started_at is not None and record.status in {"queued", "running"}:
-                live_elapsed_ms = max(0, int(round((_now() - record.stage_started_at).total_seconds() * 1000)))
+            if record.stage_started_at is not None and record.status in {
+                "queued",
+                "running",
+            }:
+                live_elapsed_ms = max(
+                    0,
+                    int(
+                        round((_now() - record.stage_started_at).total_seconds() * 1000)
+                    ),
+                )
                 if live_elapsed_ms > 0:
-                    stage_durations_ms[current_stage] = int(stage_durations_ms.get(current_stage, 0)) + live_elapsed_ms
+                    stage_durations_ms[current_stage] = (
+                        int(stage_durations_ms.get(current_stage, 0)) + live_elapsed_ms
+                    )
             safe_completed_at = record.completed_at or _now()
-            total_duration_ms = max(0, int(round((safe_completed_at - record.created_at).total_seconds() * 1000)))
+            total_duration_ms = max(
+                0,
+                int(
+                    round(
+                        (safe_completed_at - record.created_at).total_seconds() * 1000
+                    )
+                ),
+            )
             if isinstance(record.stage_detail, dict) and record.stage_detail:
                 stage_detail = dict(record.stage_detail)
                 stage_detail["stage"] = self._map_stage_for_display(
@@ -1051,7 +1438,9 @@ class SubtitleJobManager:
                     sync_diagnostics = extracted
         if record.status == "failed" and record.partial_result is None:
             if record.job_kind == "llm_resume":
-                partial = _build_partial_from_sentences(record.resume_sentences, record.resume_word_segments)
+                partial = _build_partial_from_sentences(
+                    record.resume_sentences, record.resume_word_segments
+                )
             else:
                 partial = _build_partial_result(record.work_dir)
             if partial:
@@ -1059,17 +1448,23 @@ class SubtitleJobManager:
                 partial["partial_stage"] = record.current_stage or "llm"
                 partial["partial_error"] = record.error or record.message or ""
                 record.partial_result = partial
-                print(f"[DEBUG] Lazily attached partial_result to failed job {record.job_id}.")
+                print(
+                    f"[DEBUG] Lazily attached partial_result to failed job {record.job_id}."
+                )
 
         payload = {
             "job_id": record.job_id,
             "status": record.status,
             "progress_percent": record.progress_percent,
             "current_stage": current_stage,
-            "message": self._map_message_for_display(message, translation_model_requested=translation_model_requested),
+            "message": self._map_message_for_display(
+                message, translation_model_requested=translation_model_requested
+            ),
             "error": record.error,
             "error_code": str(record.error_code or "").strip(),
-            "error_detail": dict(record.error_detail) if isinstance(record.error_detail, dict) else None,
+            "error_detail": dict(record.error_detail)
+            if isinstance(record.error_detail, dict)
+            else None,
             "started_at": _iso(record.started_at),
             "updated_at": _iso(record.updated_at),
             "cancel_requested": bool(record.cancel_requested),
@@ -1078,7 +1473,9 @@ class SubtitleJobManager:
             "whisper_model_effective": record.whisper_model_effective or "",
             "asr_provider_effective": record.asr_provider_effective or "",
             "asr_fallback_used": bool(record.asr_fallback_used),
-            "test_simplified_flow": bool((record.options or {}).get("test_simplified_flow", False)),
+            "test_simplified_flow": bool(
+                (record.options or {}).get("test_simplified_flow", False)
+            ),
             "queue_ahead": queue_ahead,
             "worker_alive": worker_alive,
             "stage_durations_ms": stage_durations_ms,
@@ -1153,7 +1550,9 @@ class SubtitleJobManager:
                     should_wait = True
                 else:
                     self._active_jobs_total += 1
-                    self._active_by_user[record.user_id] = int(self._active_by_user.get(record.user_id, 0)) + 1
+                    self._active_by_user[record.user_id] = (
+                        int(self._active_by_user.get(record.user_id, 0)) + 1
+                    )
                     active_user_id = record.user_id
                     job_started = True
                     now = _now()
@@ -1196,12 +1595,17 @@ class SubtitleJobManager:
                         sentences=record.resume_sentences,
                         options=record.options,
                         word_segments=record.resume_word_segments,
-                        progress=lambda p, s, m, d=None: self._update_progress(job_id, p, s, m, d),
+                        progress=lambda p, s, m, d=None: self._update_progress(
+                            job_id, p, s, m, d
+                        ),
                         should_cancel=lambda: self._should_cancel_job(job_id),
                     )
                 else:
                     if record.job_kind == "url":
-                        def report_download_progress(download_percent: int, message: str) -> None:
+
+                        def report_download_progress(
+                            download_percent: int, message: str
+                        ) -> None:
                             normalized = max(0, min(100, int(download_percent)))
                             mapped_percent = 3 + int(round((normalized / 100) * 9))
                             self._update_progress(
@@ -1221,10 +1625,16 @@ class SubtitleJobManager:
                             if normalized <= 8:
                                 mapped_percent = 12
                             else:
-                                mapped_percent = 12 + int(round(((normalized - 8) / 92) * 88))
-                            self._update_progress(job_id, mapped_percent, stage, message, detail)
+                                mapped_percent = 12 + int(
+                                    round(((normalized - 8) / 92) * 88)
+                                )
+                            self._update_progress(
+                                job_id, mapped_percent, stage, message, detail
+                            )
 
-                        self._update_progress(job_id, 3, "download_source", "正在解析并下载素材链接")
+                        self._update_progress(
+                            job_id, 3, "download_source", "正在解析并下载素材链接"
+                        )
                         downloaded_video = download_video_from_url(
                             record.source_url,
                             Path(record.work_dir) / "input",
@@ -1232,12 +1642,18 @@ class SubtitleJobManager:
                             on_progress=report_download_progress,
                         )
                         record.video_path = downloaded_video
-                        self._update_progress(job_id, 12, "download_source", "素材下载完成，准备提取音频")
+                        self._update_progress(
+                            job_id, 12, "download_source", "素材下载完成，准备提取音频"
+                        )
                     validate_video_file(record.video_path)
                     progress_callback = (
                         report_url_pipeline_progress
                         if record.job_kind == "url"
-                        else (lambda p, s, m, d=None: self._update_progress(job_id, p, s, m, d))
+                        else (
+                            lambda p, s, m, d=None: self._update_progress(
+                                job_id, p, s, m, d
+                            )
+                        )
                     )
                     result = run_subtitle_pipeline(
                         video_path=record.video_path,
@@ -1265,7 +1681,11 @@ class SubtitleJobManager:
                             current,
                             stage="cancelled",
                             now=now,
-                            detail={"step_key": "cancelled", "step_label": "任务已取消", "percent_in_stage": 100},
+                            detail={
+                                "step_key": "cancelled",
+                                "step_label": "任务已取消",
+                                "percent_in_stage": 100,
+                            },
                         )
                         self._append_progress_event_locked(
                             current,
@@ -1281,17 +1701,29 @@ class SubtitleJobManager:
                         continue
                     stats = result.get("stats") if isinstance(result, dict) else {}
                     if isinstance(stats, dict):
-                        current.whisper_runtime = str(stats.get("whisper_runtime") or current.whisper_runtime or "")
+                        current.whisper_runtime = str(
+                            stats.get("whisper_runtime")
+                            or current.whisper_runtime
+                            or ""
+                        )
                         current.whisper_model_requested = str(
-                            stats.get("whisper_model_requested") or current.whisper_model_requested or ""
+                            stats.get("whisper_model_requested")
+                            or current.whisper_model_requested
+                            or ""
                         )
                         current.whisper_model_effective = str(
-                            stats.get("whisper_model_effective") or current.whisper_model_effective or ""
+                            stats.get("whisper_model_effective")
+                            or current.whisper_model_effective
+                            or ""
                         )
                         current.asr_provider_effective = str(
-                            stats.get("asr_provider_effective") or current.asr_provider_effective or ""
+                            stats.get("asr_provider_effective")
+                            or current.asr_provider_effective
+                            or ""
                         )
-                        current.asr_fallback_used = bool(stats.get("asr_fallback_used") or False)
+                        current.asr_fallback_used = bool(
+                            stats.get("asr_fallback_used") or False
+                        )
                     now = _now()
                     current.status = "completed"
                     current.progress_percent = 100
@@ -1302,14 +1734,20 @@ class SubtitleJobManager:
                     current.error_detail = None
                     current.result = result
                     current.partial_result = None
-                    current.sync_diagnostics = self._extract_sync_diagnostics_from_result(result)
+                    current.sync_diagnostics = (
+                        self._extract_sync_diagnostics_from_result(result)
+                    )
                     current.completed_at = now
                     current.updated_at = now
                     self._set_stage_detail_locked(
                         current,
                         stage="completed",
                         now=now,
-                        detail={"step_key": "completed", "step_label": "任务完成", "percent_in_stage": 100},
+                        detail={
+                            "step_key": "completed",
+                            "step_label": "任务完成",
+                            "percent_in_stage": 100,
+                        },
                     )
                     self._append_progress_event_locked(
                         current,
@@ -1323,8 +1761,9 @@ class SubtitleJobManager:
                     self._finalize_stage_tracking_locked(current, now=now)
                     self._persist_record_locked(current)
                     if isinstance(stats, dict):
+                        asr_cost_row: dict[str, str] | None = None
                         try:
-                            append_asr_cost_record(
+                            asr_cost_row = append_asr_cost_record(
                                 job_id=current.job_id,
                                 stats=stats,
                                 whisper_runtime=current.whisper_runtime,
@@ -1332,28 +1771,52 @@ class SubtitleJobManager:
                                 asr_provider_effective=current.asr_provider_effective,
                             )
                         except Exception as exc:
-                            print(f"[DEBUG] Failed to append ASR cost ledger job_id={current.job_id}: {exc}")
+                            print(
+                                f"[DEBUG] Failed to append ASR cost ledger job_id={current.job_id}: {exc}"
+                            )
+                        try:
+                            self._append_asr_wallet_charge_from_cost_row(
+                                record=current, asr_cost_row=asr_cost_row
+                            )
+                        except Exception as exc:
+                            print(
+                                f"[DEBUG] Failed to append ASR wallet charge job_id={current.job_id}: {exc}"
+                            )
                         try:
                             append_llm_cost_record(
                                 scene="subtitle_pipeline",
                                 owner_id=current.job_id,
                                 stats=stats,
                                 llm_base_url=str(stats.get("llm_base_url") or ""),
-                                llm_provider_effective=str(stats.get("llm_provider_effective") or ""),
-                                llm_model_effective=str(stats.get("llm_model_effective") or ""),
-                                provider_request_id=str(stats.get("provider_request_id") or ""),
+                                llm_provider_effective=str(
+                                    stats.get("llm_provider_effective") or ""
+                                ),
+                                llm_model_effective=str(
+                                    stats.get("llm_model_effective") or ""
+                                ),
+                                provider_request_id=str(
+                                    stats.get("provider_request_id") or ""
+                                ),
                             )
                         except Exception as exc:
-                            print(f"[DEBUG] Failed to append llm cost ledger job_id={current.job_id}: {exc}")
+                            print(
+                                f"[DEBUG] Failed to append llm cost ledger job_id={current.job_id}: {exc}"
+                            )
                         try:
                             append_translation_cost_record(
                                 job_id=current.job_id,
                                 stats=stats,
-                                translation_provider_effective=str(stats.get("translation_provider_effective") or ""),
-                                translation_model_effective=str(stats.get("translation_model_effective") or ""),
+                                translation_provider_effective=str(
+                                    stats.get("translation_provider_effective") or ""
+                                ),
+                                translation_model_effective=str(
+                                    stats.get("translation_model_effective") or ""
+                                ),
                             )
                         except Exception as exc:
-                            print(f"[DEBUG] Failed to append translation cost ledger job_id={current.job_id}: {exc}")
+                            print(
+                                f"[DEBUG] Failed to append translation cost ledger job_id={current.job_id}: {exc}"
+                            )
                     # URL 素材模式需保留下载视频用于前端回传，其他模式仍立即清理。
                     if current.source_mode != "url":
                         safe_rmtree(current.work_dir)
@@ -1382,7 +1845,11 @@ class SubtitleJobManager:
                             current,
                             stage="cancelled",
                             now=now,
-                            detail={"step_key": "cancelled", "step_label": "任务已取消", "percent_in_stage": 100},
+                            detail={
+                                "step_key": "cancelled",
+                                "step_label": "任务已取消",
+                                "percent_in_stage": 100,
+                            },
                         )
                         self._append_progress_event_locked(
                             current,
@@ -1411,13 +1878,19 @@ class SubtitleJobManager:
                                 now = _now()
                                 current.status = "completed"
                                 current.progress_percent = 100
-                                self._transition_stage_locked(current, "completed", now=now)
-                                current.message = "任务完成（LLM 输出异常，已保留基础字幕）"
+                                self._transition_stage_locked(
+                                    current, "completed", now=now
+                                )
+                                current.message = (
+                                    "任务完成（LLM 输出异常，已保留基础字幕）"
+                                )
                                 current.error = None
                                 current.error_code = str(exc.code or "llm_invalid_json")
                                 current.error_detail = exc.to_dict()
                                 current.result = partial
-                                current.sync_diagnostics = self._extract_sync_diagnostics_from_result(partial)
+                                current.sync_diagnostics = (
+                                    self._extract_sync_diagnostics_from_result(partial)
+                                )
                                 current.completed_at = now
                                 current.updated_at = now
                                 self._set_stage_detail_locked(
@@ -1441,7 +1914,9 @@ class SubtitleJobManager:
                                 self._bump_status_revision_locked(current)
                                 self._finalize_stage_tracking_locked(current, now=now)
                                 self._persist_record_locked(current)
-                                print(f"[DEBUG] Completed job {job_id} with partial result due to LLM JSON error.")
+                                print(
+                                    f"[DEBUG] Completed job {job_id} with partial result due to LLM JSON error."
+                                )
                                 continue
                         now = _now()
                         current.status = "failed"
@@ -1462,7 +1937,9 @@ class SubtitleJobManager:
                             partial["partial_stage"] = exc.stage
                             partial["partial_error"] = exc.message
                             current.partial_result = partial
-                            current.sync_diagnostics = self._extract_sync_diagnostics_from_result(partial)
+                            current.sync_diagnostics = (
+                                self._extract_sync_diagnostics_from_result(partial)
+                            )
                         else:
                             current.sync_diagnostics = {}
                         current.completed_at = now
@@ -1471,7 +1948,11 @@ class SubtitleJobManager:
                             current,
                             stage=exc.stage,
                             now=now,
-                            detail={"step_key": "failed", "step_label": exc.message, "percent_in_stage": 100},
+                            detail={
+                                "step_key": "failed",
+                                "step_label": exc.message,
+                                "percent_in_stage": 100,
+                            },
                         )
                         self._append_progress_event_locked(
                             current,
@@ -1507,7 +1988,11 @@ class SubtitleJobManager:
                         current,
                         stage="pipeline",
                         now=now,
-                        detail={"step_key": "failed", "step_label": "任务执行失败", "percent_in_stage": 100},
+                        detail={
+                            "step_key": "failed",
+                            "step_label": "任务执行失败",
+                            "percent_in_stage": 100,
+                        },
                     )
                     self._append_progress_event_locked(
                         current,
@@ -1525,7 +2010,9 @@ class SubtitleJobManager:
                     if job_started:
                         self._active_jobs_total = max(0, self._active_jobs_total - 1)
                         if active_user_id:
-                            next_count = max(0, int(self._active_by_user.get(active_user_id, 0)) - 1)
+                            next_count = max(
+                                0, int(self._active_by_user.get(active_user_id, 0)) - 1
+                            )
                             if next_count <= 0:
                                 self._active_by_user.pop(active_user_id, None)
                             else:
