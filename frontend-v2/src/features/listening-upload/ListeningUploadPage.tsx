@@ -93,6 +93,7 @@ type SourceMode = 'file' | 'url';
 
 const INVALID_LOCAL_MODELS = new Set([
   'paraformer-v2',
+  'qwen3-asr-flash',
   'qwen3-asr-flash-filetrans',
   'distil-large-v2',
   'large-v3-turbo',

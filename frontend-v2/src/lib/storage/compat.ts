@@ -889,6 +889,12 @@ export function mapFormToSubtitleJobOptions(
   form: SubtitleOptionForm,
   llmOverride?: Partial<SubtitleJobOptions['llm']> | null
 ): SubtitleJobOptionsPayload {
+  const normalizeWhisperModelForPayload = (value: string) => {
+    const safe = String(value || '').trim();
+    if (!safe) return DEFAULT_WHISPER_MODEL;
+    if (safe.toLowerCase() === 'qwen3-asr-flash') return 'qwen3-asr-flash-filetrans';
+    return safe;
+  };
   const profile = normalizeAsrProfile(form.asrProfile);
   const whisperRuntime = form.whisperRuntime === 'local' ? 'local' : 'cloud';
   const whisperBaseUrl = whisperRuntime === 'cloud'
@@ -906,7 +912,7 @@ export function mapFormToSubtitleJobOptions(
     llm: llmPayload,
     whisper: {
       runtime: whisperRuntime,
-      model: form.whisperModel.trim() || DEFAULT_WHISPER_MODEL,
+      model: normalizeWhisperModelForPayload(form.whisperModel),
       language: form.whisperLanguage.trim() || DEFAULT_WHISPER_LANGUAGE,
       base_url: whisperBaseUrl,
       api_key: whisperApiKey
