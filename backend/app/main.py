@@ -13,6 +13,7 @@ import wave
 from io import BytesIO
 from pathlib import Path
 from time import time
+from typing import Any
 from urllib.parse import urlparse
 
 import requests

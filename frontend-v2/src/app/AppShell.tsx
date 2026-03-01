@@ -32,6 +32,7 @@ const titleMap: Record<string, { title: string; subtitle: string }> = {
   '/listening/practice': { title: '听力练习', subtitle: '句级听写、快捷键与沉浸式输入' },
   '/reading': { title: '阅读强化工坊', subtitle: '分级改写、关键词讲解、理解题与复盘' },
   '/wallet': { title: '额度中心', subtitle: '兑换码充值、额度余额与档位说明' },
+  '/asr-console': { title: 'ASR 管理台', subtitle: '语音识别路由、倍率和扣费流水' },
   '/profile': { title: '个人中心', subtitle: '管理英语等级与学习账户信息' }
 };
 
