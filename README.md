@@ -117,6 +117,32 @@ npm run dev -- --host 127.0.0.1 --port 8510 --strictPort
 - 仓库已提供 `npm run predeploy:check` 与 `npm run build:zeabur` 作为部署前门禁（Node 20、`file:` 依赖、`vite/client` 类型解析、环境变量校验）
 - `build:zeabur` 会严格校验 `VITE_SUBTITLE_API_BASE`：必须是非 localhost 的 http(s) 地址，且必须以 `/api/v1` 结尾
 
+### ASR Admin 独立后台服务（推荐）
+
+为满足“普通用户完全不可见、管理员独立管理”，新增独立管理服务：
+
+- 服务类型：Python
+- Root Directory：`backend`
+- Install Command：`pip install -r requirements.txt`
+- Start Command：`uvicorn app.admin_console_main:app --host 0.0.0.0 --port $PORT`
+
+Admin 服务环境变量：
+
+- `ONEAPI_BASE_URL`：OneAPI 服务根地址
+- `ONEAPI_API_PREFIX`：OneAPI 接口前缀（默认 `/api`）
+- `USER_BACKEND_API_BASE`：用户后端 API 基址（示例：`https://es-deploy-api.preview.aliyun-zeabur.cn/api/v1`）
+- `ASR_ADMIN_SERVICE_TOKEN`：Admin 服务调用用户后端内部管理接口的共享令牌（必须，与用户后端一致）
+- `ADMIN_SESSION_TTL_HOURS`：管理员登录态有效期（默认 `12`）
+
+用户后端新增必须环境变量：
+
+- `ASR_ADMIN_SERVICE_TOKEN`：与 Admin 服务一致；用于保护内部接口 `/api/v1/internal/asr-admin/*`
+
+说明：
+
+- 普通用户站点已移除 ASR 管理台入口与页面。
+- 管理功能（全局用户、调账、倍率、路由、流水导出）仅在独立 Admin 服务提供。
+
 ## 鉴权与接口
 
 认证接口：

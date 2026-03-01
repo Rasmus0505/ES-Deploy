@@ -59,13 +59,6 @@ export const appNavGroups: AppNavGroup[] = [
         label: '新建任务',
         subtitle: '上传视频并自动生成字幕',
         icon: UploadCloud
-      },
-      {
-        id: 'asr-console',
-        path: '/asr-console',
-        label: 'ASR管理台',
-        subtitle: '路由状态与扣费流水',
-        icon: WalletCards
       }
     ]
   }

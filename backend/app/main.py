@@ -31,6 +31,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from openai import OpenAI
 
+from app.asr_runtime_store import AsrRuntimeConfigStore
 from app.auth_service import AuthError, AuthPrincipal, AuthService
 from app.history_store import SqliteHistoryStore
 from app.job_manager import SubtitleJobManager
@@ -55,7 +56,6 @@ from app.reading_store import SqliteReadingStore
 from app.security_crypto import mask_secret
 from app.url_ingest import evaluate_source_url_policy, normalize_source_url
 from app.schemas import (
-    AsrConsoleResponse,
     AuthLoginRequest,
     AuthLogoutResponse,
     AuthRegisterRequest,
@@ -164,6 +164,10 @@ DASHSCOPE_ASR_API_KEY = str(os.getenv("DASHSCOPE_API_KEY", "")).strip()
 ASR_SUBMIT_MIN_REMAINING_QUOTA = max(
     1, int(float(os.getenv("ASR_SUBMIT_MIN_REMAINING_QUOTA", "1") or 1))
 )
+DEFAULT_ASR_ROUTE_MODE = (
+    "dashscope_direct" if DASHSCOPE_ASR_API_KEY else "oneapi_fallback"
+)
+ASR_ADMIN_SERVICE_TOKEN = str(os.getenv("ASR_ADMIN_SERVICE_TOKEN", "")).strip()
 DEFAULT_WALLET_PACKS = [
     {
         "id": "trial",
@@ -276,19 +280,31 @@ def _build_oneapi_user_whisper_payload(
     model = str(safe.get("model") or "").strip() or default_model
     language = str(safe.get("language") or "").strip() or "en"
     if runtime == "cloud":
-        if DASHSCOPE_ASR_API_KEY:
+        runtime_config = _resolve_asr_runtime_config()
+        route_mode = str(
+            runtime_config.get("route_mode") or DEFAULT_ASR_ROUTE_MODE
+        ).strip()
+        dashscope_base_url = _normalize_whisper_base_url(
+            str(runtime_config.get("dashscope_base_url") or DASHSCOPE_ASR_BASE_URL)
+        )
+        if route_mode == "dashscope_direct" and DASHSCOPE_ASR_API_KEY:
             print(
                 "[DEBUG] ASR route selected: direct_dashscope "
-                f"model={model} base_url={DASHSCOPE_ASR_BASE_URL}"
+                f"model={model} base_url={dashscope_base_url}"
             )
             return {
                 "runtime": "cloud",
                 "model": model,
                 "language": language,
-                "base_url": DASHSCOPE_ASR_BASE_URL,
+                "base_url": dashscope_base_url,
                 "api_key": DASHSCOPE_ASR_API_KEY,
             }
-        print("[DEBUG] ASR route selected: oneapi_fallback (missing DASHSCOPE_API_KEY)")
+        if route_mode == "dashscope_direct" and not DASHSCOPE_ASR_API_KEY:
+            print(
+                "[DEBUG] ASR route expected dashscope_direct but DASHSCOPE_API_KEY missing, fallback to oneapi"
+            )
+        else:
+            print("[DEBUG] ASR route selected: oneapi_fallback")
         return {
             "runtime": "cloud",
             "model": model,
@@ -351,6 +367,23 @@ history_store = SqliteHistoryStore(db_path=str(LOCAL_SQLITE_DB))
 reading_store = SqliteReadingStore(db_path=str(LOCAL_SQLITE_DB))
 profile_store = reading_store
 auth_service = AuthService()
+asr_runtime_store = AsrRuntimeConfigStore(
+    db_path=str(LOCAL_SQLITE_DB),
+    default_route_mode=DEFAULT_ASR_ROUTE_MODE,
+    default_dashscope_base_url=DASHSCOPE_ASR_BASE_URL,
+    default_global_multiplier=ASR_WALLET_COST_MULTIPLIER,
+    default_submit_min_remaining_quota=ASR_SUBMIT_MIN_REMAINING_QUOTA,
+)
+
+
+def _resolve_asr_runtime_config() -> dict:
+    return asr_runtime_store.get_config()
+
+
+def _resolve_asr_wallet_multiplier_for_model(model: str) -> float:
+    return asr_runtime_store.resolve_multiplier(model=model)
+
+
 job_manager = SubtitleJobManager(
     runtime_root=str(RUNTIME_JOBS_ROOT),
     db_path=str(LOCAL_SQLITE_DB),
@@ -362,6 +395,7 @@ job_manager = SubtitleJobManager(
     ),
     asr_wallet_cost_multiplier=ASR_WALLET_COST_MULTIPLIER,
     wallet_quota_per_cny=WALLET_QUOTA_PER_CNY,
+    asr_wallet_multiplier_resolver=_resolve_asr_wallet_multiplier_for_model,
 )
 LOCAL_WHISPER_MODEL_CANDIDATES = ("tiny", "base", "small", "medium", "large-v3")
 
@@ -506,12 +540,32 @@ def _ensure_asr_submit_quota(principal: AuthPrincipal, options: dict) -> None:
     runtime = str((whisper or {}).get("runtime") or "cloud").strip().lower() or "cloud"
     if runtime != "cloud":
         return
+    model = (
+        str((whisper or {}).get("model") or "paraformer-v2").strip() or "paraformer-v2"
+    )
+    if not asr_runtime_store.is_model_enabled(model=model):
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "code": "asr_model_disabled",
+                "message": f"模型已被管理员禁用：{model}",
+                "model": model,
+            },
+        )
     try:
         quota_payload = _get_effective_wallet_quota(principal)
     except AuthError as exc:
         raise _auth_http_exception(exc) from exc
     remaining_quota = max(0, int(quota_payload.get("remaining_quota") or 0))
-    if remaining_quota >= ASR_SUBMIT_MIN_REMAINING_QUOTA:
+    runtime_config = _resolve_asr_runtime_config()
+    required_quota = max(
+        1,
+        int(
+            runtime_config.get("submit_min_remaining_quota")
+            or ASR_SUBMIT_MIN_REMAINING_QUOTA
+        ),
+    )
+    if remaining_quota >= required_quota:
         return
     raise HTTPException(
         status_code=402,
@@ -519,7 +573,7 @@ def _ensure_asr_submit_quota(principal: AuthPrincipal, options: dict) -> None:
             "code": "asr_wallet_quota_exhausted",
             "message": "当前余额不足，无法发起 ASR 任务，请先充值",
             "remaining_quota": remaining_quota,
-            "required_quota": ASR_SUBMIT_MIN_REMAINING_QUOTA,
+            "required_quota": required_quota,
             "wallet": quota_payload,
         },
     )
@@ -549,55 +603,82 @@ def _to_wallet_packs_response() -> WalletPacksResponse:
     )
 
 
-def _resolve_asr_route_mode() -> str:
-    if DASHSCOPE_ASR_API_KEY:
-        return "dashscope_direct"
-    return "oneapi_fallback"
-
-
-def _to_asr_console_response(
-    *,
-    principal: AuthPrincipal,
-    wallet_quota: dict,
-    asr_usage: dict,
-    charges: list[dict[str, Any]],
-) -> AsrConsoleResponse:
-    route_mode = _resolve_asr_route_mode()
+def _public_asr_runtime_config_payload() -> dict[str, Any]:
+    config = _resolve_asr_runtime_config()
+    route_mode = str(config.get("route_mode") or DEFAULT_ASR_ROUTE_MODE).strip()
     route_base_url = (
-        DASHSCOPE_ASR_BASE_URL
+        str(config.get("dashscope_base_url") or DASHSCOPE_ASR_BASE_URL).strip()
         if route_mode == "dashscope_direct"
         else ONEAPI_V1_BASE_URL
     )
-    safe_wallet = wallet_quota if isinstance(wallet_quota, dict) else {}
-    safe_usage = asr_usage if isinstance(asr_usage, dict) else {}
-    safe_charges = charges if isinstance(charges, list) else []
-    api_key_value = DASHSCOPE_ASR_API_KEY if route_mode == "dashscope_direct" else ""
-    return AsrConsoleResponse.model_validate(
-        {
-            "route_mode": route_mode,
-            "route_base_url": route_base_url,
-            "api_key_configured": bool(api_key_value),
-            "api_key_masked": mask_secret(api_key_value),
-            "cost_multiplier": ASR_WALLET_COST_MULTIPLIER,
-            "quota_per_cny": WALLET_QUOTA_PER_CNY,
-            "submit_min_remaining_quota": ASR_SUBMIT_MIN_REMAINING_QUOTA,
-            "user_id": str(safe_wallet.get("user_id") or principal.user_id),
-            "username": str(safe_wallet.get("username") or principal.username),
-            "quota": max(0, int(safe_wallet.get("quota") or 0)),
-            "used_quota": max(0, int(safe_wallet.get("used_quota") or 0)),
-            "remaining_quota": max(0, int(safe_wallet.get("remaining_quota") or 0)),
-            "request_count": max(0, int(safe_wallet.get("request_count") or 0)),
-            "asr_used_quota": max(0, int(safe_usage.get("billed_quota") or 0)),
-            "asr_charge_count": max(0, int(safe_usage.get("charge_count") or 0)),
-            "asr_base_cost_cny": max(
-                0.0, float(safe_usage.get("base_cost_cny") or 0.0)
+    return {
+        "route_mode": route_mode,
+        "route_base_url": route_base_url,
+        "dashscope_base_url": str(
+            config.get("dashscope_base_url") or DASHSCOPE_ASR_BASE_URL
+        ).strip(),
+        "api_key_configured": bool(DASHSCOPE_ASR_API_KEY),
+        "api_key_masked": mask_secret(DASHSCOPE_ASR_API_KEY),
+        "global_multiplier": max(0.0, float(config.get("global_multiplier") or 0.0)),
+        "model_multipliers": (
+            config.get("model_multipliers")
+            if isinstance(config.get("model_multipliers"), dict)
+            else {}
+        ),
+        "model_enabled": (
+            config.get("model_enabled")
+            if isinstance(config.get("model_enabled"), dict)
+            else {}
+        ),
+        "submit_min_remaining_quota": max(
+            1,
+            int(
+                config.get("submit_min_remaining_quota")
+                or ASR_SUBMIT_MIN_REMAINING_QUOTA
             ),
-            "asr_billed_cost_cny": max(
-                0.0, float(safe_usage.get("billed_cost_cny") or 0.0)
-            ),
-            "charges": safe_charges,
-        }
-    )
+        ),
+        "updated_by": str(config.get("updated_by") or ""),
+        "note": str(config.get("note") or ""),
+        "updated_at": max(0, int(config.get("updated_at") or 0)),
+    }
+
+
+def _extract_admin_service_token(request: Request) -> str:
+    token = str(request.headers.get("x-asr-admin-service-token") or "").strip()
+    if token:
+        return token
+    auth_header = str(request.headers.get("authorization") or "").strip()
+    if auth_header.lower().startswith("bearer "):
+        return auth_header.split(" ", 1)[1].strip()
+    return ""
+
+
+def _require_internal_asr_admin_service(request: Request) -> None:
+    if not ASR_ADMIN_SERVICE_TOKEN:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "code": "asr_admin_service_token_not_configured",
+                "message": "ASR_ADMIN_SERVICE_TOKEN 未配置，内部管理接口不可用",
+            },
+        )
+    provided = _extract_admin_service_token(request)
+    if not provided:
+        raise HTTPException(
+            status_code=401,
+            detail={
+                "code": "asr_admin_service_token_required",
+                "message": "缺少内部管理令牌",
+            },
+        )
+    if provided != ASR_ADMIN_SERVICE_TOKEN:
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "code": "asr_admin_service_token_invalid",
+                "message": "内部管理令牌无效",
+            },
+        )
 
 
 def _infer_llm_provider_effective(base_url: str) -> str:
@@ -1602,31 +1683,119 @@ def get_wallet_packs() -> WalletPacksResponse:
     return _to_wallet_packs_response()
 
 
-@app.get("/api/v1/asr/console", response_model=AsrConsoleResponse)
-def get_asr_console(
-    limit: int = 20,
+@app.get("/api/v1/asr/console")
+def get_asr_console_removed(
     principal: AuthPrincipal = Depends(_require_principal),
-) -> AsrConsoleResponse:
-    safe_limit = max(1, min(200, int(limit or 20)))
+) -> dict:
+    _ = principal
+    raise HTTPException(
+        status_code=410,
+        detail={
+            "code": "asr_console_moved",
+            "message": "ASR 管理台已迁移到独立 Admin 服务，普通用户站点不再提供该页面。",
+        },
+    )
+
+
+@app.get("/api/v1/internal/asr-admin/runtime-config")
+def internal_get_asr_runtime_config(request: Request) -> dict:
+    _require_internal_asr_admin_service(request)
+    payload = _public_asr_runtime_config_payload()
+    return {
+        "status": "ok",
+        "config": payload,
+    }
+
+
+@app.put("/api/v1/internal/asr-admin/runtime-config")
+async def internal_update_asr_runtime_config(request: Request) -> dict:
+    _require_internal_asr_admin_service(request)
     try:
-        wallet_quota = _get_effective_wallet_quota(principal)
-    except AuthError as exc:
-        raise _auth_http_exception(exc) from exc
-    asr_usage = job_manager.get_user_asr_wallet_usage(user_id=principal.user_id)
-    charges = job_manager.list_user_asr_wallet_charges(
-        user_id=principal.user_id,
-        limit=safe_limit,
+        body = await request.json()
+    except Exception:
+        body = {}
+    patch = body if isinstance(body, dict) else {}
+    safe_patch: dict[str, Any] = {}
+
+    if "route_mode" in patch:
+        safe_patch["route_mode"] = str(patch.get("route_mode") or "").strip().lower()
+    if "dashscope_base_url" in patch:
+        safe_patch["dashscope_base_url"] = _normalize_whisper_base_url(
+            str(patch.get("dashscope_base_url") or "")
+        )
+    if "global_multiplier" in patch:
+        safe_patch["global_multiplier"] = max(
+            0.0, float(patch.get("global_multiplier") or 0.0)
+        )
+    if "submit_min_remaining_quota" in patch:
+        safe_patch["submit_min_remaining_quota"] = max(
+            1,
+            int(float(patch.get("submit_min_remaining_quota") or 1)),
+        )
+    if "model_multipliers" in patch and isinstance(
+        patch.get("model_multipliers"), dict
+    ):
+        safe_patch["model_multipliers"] = patch.get("model_multipliers")
+    if "model_enabled" in patch and isinstance(patch.get("model_enabled"), dict):
+        safe_patch["model_enabled"] = patch.get("model_enabled")
+
+    updated_by = (
+        str(request.headers.get("x-asr-admin-actor") or "").strip()
+        or "asr-admin-service"
+    )
+    note = str(patch.get("note") or "").strip() if isinstance(patch, dict) else ""
+
+    updated = asr_runtime_store.update_config(
+        patch=safe_patch,
+        updated_by=updated_by,
+        note=note,
     )
     print(
-        "[DEBUG] ASR console fetched "
-        f"user_id={principal.user_id} route={_resolve_asr_route_mode()} charges={len(charges)}"
+        "[DEBUG] Internal ASR runtime config updated "
+        f"by={updated_by} route_mode={updated.get('route_mode')}"
     )
-    return _to_asr_console_response(
-        principal=principal,
-        wallet_quota=wallet_quota,
-        asr_usage=asr_usage,
-        charges=charges,
+    return {
+        "status": "ok",
+        "config": _public_asr_runtime_config_payload(),
+    }
+
+
+@app.get("/api/v1/internal/asr-admin/users")
+def internal_list_asr_users(
+    request: Request,
+    limit: int = 100,
+    offset: int = 0,
+    keyword: str = "",
+) -> dict:
+    _require_internal_asr_admin_service(request)
+    payload = job_manager.list_global_asr_wallet_usage(
+        limit=limit,
+        offset=offset,
+        keyword=keyword,
     )
+    return {
+        "status": "ok",
+        **payload,
+    }
+
+
+@app.get("/api/v1/internal/asr-admin/charges")
+def internal_list_asr_charges(
+    request: Request,
+    limit: int = 200,
+    offset: int = 0,
+    user_id: str = "",
+) -> dict:
+    _require_internal_asr_admin_service(request)
+    payload = job_manager.list_global_asr_wallet_charges(
+        limit=limit,
+        offset=offset,
+        user_id=user_id,
+    )
+    return {
+        "status": "ok",
+        **payload,
+    }
 
 
 @app.get("/api/v1/history-records", response_model=HistoryRecordsResponse)

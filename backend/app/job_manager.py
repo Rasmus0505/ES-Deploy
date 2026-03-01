@@ -10,7 +10,7 @@ import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from app.asr_cost_ledger import append_asr_cost_record
 from app.llm_cost_ledger import append_llm_cost_record
@@ -238,6 +238,7 @@ class SubtitleJobManager:
         per_user_concurrency_limit: int = 1,
         asr_wallet_cost_multiplier: float = _DEFAULT_ASR_WALLET_COST_MULTIPLIER,
         wallet_quota_per_cny: int = _DEFAULT_WALLET_QUOTA_PER_CNY,
+        asr_wallet_multiplier_resolver: Callable[[str], float] | None = None,
     ):
         self.runtime_root = Path(runtime_root)
         self.runtime_root.mkdir(parents=True, exist_ok=True)
@@ -251,6 +252,7 @@ class SubtitleJobManager:
         self._wallet_quota_per_cny = max(
             1, int(wallet_quota_per_cny or _DEFAULT_WALLET_QUOTA_PER_CNY)
         )
+        self._asr_wallet_multiplier_resolver = asr_wallet_multiplier_resolver
         self._jobs: dict[str, JobRecord] = {}
         self._queue: queue.Queue[str] = queue.Queue()
         self._lock = threading.RLock()
@@ -533,13 +535,16 @@ class SubtitleJobManager:
     ) -> dict[str, Any] | None:
         if not isinstance(asr_cost_row, dict):
             return None
-        if self._asr_wallet_cost_multiplier <= 0:
-            return None
 
         safe_job_id = str(record.job_id or "").strip()
         if not safe_job_id:
             return None
         safe_user_id = self._normalize_user_id(record.user_id)
+        model_effective = str(
+            asr_cost_row.get("whisper_model_effective")
+            or record.whisper_model_effective
+            or ""
+        ).strip()
 
         billed_seconds = self._safe_non_negative_float(
             asr_cost_row.get("billed_seconds"), default=0.0
@@ -547,7 +552,23 @@ class SubtitleJobManager:
         base_cost_cny = self._safe_non_negative_float(
             asr_cost_row.get("cost_cny"), default=0.0
         )
-        billed_cost_cny = max(0.0, base_cost_cny * self._asr_wallet_cost_multiplier)
+
+        multiplier = self._asr_wallet_cost_multiplier
+        if callable(self._asr_wallet_multiplier_resolver):
+            try:
+                multiplier = float(
+                    self._asr_wallet_multiplier_resolver(model_effective)
+                )
+            except Exception as exc:
+                print(
+                    f"[DEBUG] Failed to resolve ASR wallet multiplier model={model_effective or '-'}: {exc}"
+                )
+        if not math.isfinite(multiplier) or multiplier < 0:
+            multiplier = 0.0
+        if multiplier <= 0:
+            return None
+
+        billed_cost_cny = max(0.0, base_cost_cny * multiplier)
         billed_quota = max(
             0, int(round(billed_cost_cny * float(self._wallet_quota_per_cny)))
         )
@@ -581,7 +602,7 @@ class SubtitleJobManager:
                     safe_user_id,
                     billed_seconds,
                     base_cost_cny,
-                    self._asr_wallet_cost_multiplier,
+                    multiplier,
                     billed_cost_cny,
                     billed_quota,
                     created_at_ms,
@@ -592,12 +613,14 @@ class SubtitleJobManager:
         print(
             f"[DEBUG] ASR wallet charge appended "
             f"job_id={safe_job_id} user_id={safe_user_id} "
-            f"base_cost_cny={base_cost_cny:.8f} multiplier={self._asr_wallet_cost_multiplier:.4f} "
+            f"model={model_effective or '-'} "
+            f"base_cost_cny={base_cost_cny:.8f} multiplier={multiplier:.4f} "
             f"billed_quota={billed_quota}"
         )
         return {
             "job_id": safe_job_id,
             "user_id": safe_user_id,
+            "model": model_effective,
             "billed_seconds": billed_seconds,
             "base_cost_cny": base_cost_cny,
             "billed_quota": billed_quota,
@@ -688,6 +711,156 @@ class SubtitleJobManager:
                 }
             )
         return result
+
+    def list_global_asr_wallet_usage(
+        self,
+        *,
+        limit: int = 100,
+        offset: int = 0,
+        keyword: str = "",
+    ) -> dict[str, Any]:
+        safe_limit = max(1, min(500, int(limit or 100)))
+        safe_offset = max(0, int(offset or 0))
+        safe_keyword = str(keyword or "").strip()
+        where_clause = ""
+        params: list[Any] = []
+        if safe_keyword:
+            where_clause = "WHERE user_id LIKE ?"
+            params.append(f"%{safe_keyword}%")
+
+        with self._connect() as connection:
+            total_row = connection.execute(
+                f"""
+                SELECT COUNT(1) AS total
+                FROM (
+                    SELECT user_id
+                    FROM subtitle_asr_wallet_usage
+                    {where_clause}
+                    GROUP BY user_id
+                )
+                """,
+                tuple(params),
+            ).fetchone()
+            rows = connection.execute(
+                f"""
+                SELECT
+                    user_id,
+                    COALESCE(SUM(billed_seconds), 0) AS billed_seconds,
+                    COALESCE(SUM(base_cost_cny), 0) AS base_cost_cny,
+                    COALESCE(SUM(billed_cost_cny), 0) AS billed_cost_cny,
+                    COALESCE(SUM(billed_quota), 0) AS billed_quota,
+                    COUNT(1) AS charge_count,
+                    COALESCE(MAX(created_at), 0) AS last_charged_at
+                FROM subtitle_asr_wallet_usage
+                {where_clause}
+                GROUP BY user_id
+                ORDER BY last_charged_at DESC
+                LIMIT ? OFFSET ?
+                """,
+                tuple(params + [safe_limit, safe_offset]),
+            ).fetchall()
+
+        items: list[dict[str, Any]] = []
+        for row in rows:
+            items.append(
+                {
+                    "user_id": str(row["user_id"] or ""),
+                    "billed_seconds": self._safe_non_negative_float(
+                        row["billed_seconds"], default=0.0
+                    ),
+                    "base_cost_cny": self._safe_non_negative_float(
+                        row["base_cost_cny"], default=0.0
+                    ),
+                    "billed_cost_cny": self._safe_non_negative_float(
+                        row["billed_cost_cny"], default=0.0
+                    ),
+                    "billed_quota": max(0, int(row["billed_quota"] or 0)),
+                    "charge_count": max(0, int(row["charge_count"] or 0)),
+                    "last_charged_at": max(0, int(row["last_charged_at"] or 0)),
+                }
+            )
+
+        total = max(0, int((total_row["total"] if total_row else 0) or 0))
+        return {
+            "items": items,
+            "total": total,
+            "offset": safe_offset,
+            "limit": safe_limit,
+            "keyword": safe_keyword,
+        }
+
+    def list_global_asr_wallet_charges(
+        self,
+        *,
+        limit: int = 100,
+        offset: int = 0,
+        user_id: str = "",
+    ) -> dict[str, Any]:
+        safe_limit = max(1, min(1000, int(limit or 100)))
+        safe_offset = max(0, int(offset or 0))
+        safe_user_id = str(user_id or "").strip()
+
+        where_clause = ""
+        params: list[Any] = []
+        if safe_user_id:
+            where_clause = "WHERE user_id=?"
+            params.append(safe_user_id)
+
+        with self._connect() as connection:
+            total_row = connection.execute(
+                f"SELECT COUNT(1) AS total FROM subtitle_asr_wallet_usage {where_clause}",
+                tuple(params),
+            ).fetchone()
+            rows = connection.execute(
+                f"""
+                SELECT
+                    job_id,
+                    user_id,
+                    billed_seconds,
+                    base_cost_cny,
+                    multiplier,
+                    billed_cost_cny,
+                    billed_quota,
+                    created_at
+                FROM subtitle_asr_wallet_usage
+                {where_clause}
+                ORDER BY created_at DESC
+                LIMIT ? OFFSET ?
+                """,
+                tuple(params + [safe_limit, safe_offset]),
+            ).fetchall()
+
+        items: list[dict[str, Any]] = []
+        for row in rows:
+            items.append(
+                {
+                    "job_id": str(row["job_id"] or ""),
+                    "user_id": str(row["user_id"] or ""),
+                    "billed_seconds": self._safe_non_negative_float(
+                        row["billed_seconds"], default=0.0
+                    ),
+                    "base_cost_cny": self._safe_non_negative_float(
+                        row["base_cost_cny"], default=0.0
+                    ),
+                    "multiplier": self._safe_non_negative_float(
+                        row["multiplier"], default=0.0
+                    ),
+                    "billed_cost_cny": self._safe_non_negative_float(
+                        row["billed_cost_cny"], default=0.0
+                    ),
+                    "billed_quota": max(0, int(row["billed_quota"] or 0)),
+                    "created_at": max(0, int(row["created_at"] or 0)),
+                }
+            )
+
+        total = max(0, int((total_row["total"] if total_row else 0) or 0))
+        return {
+            "items": items,
+            "total": total,
+            "offset": safe_offset,
+            "limit": safe_limit,
+            "user_id": safe_user_id,
+        }
 
     def _can_start_job_locked(self, record: JobRecord) -> bool:
         if self._active_jobs_total >= self._global_concurrency_limit:

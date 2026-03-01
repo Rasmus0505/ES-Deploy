@@ -1,5 +1,4 @@
 import type {
-  AsrConsoleResponse,
   WalletPacksResponse,
   WalletQuotaResponse,
   WalletRedeemRequest,
@@ -21,9 +20,4 @@ export async function redeemWalletCode(payload: WalletRedeemRequest) {
     body: payload,
     retry: 0
   });
-}
-
-export async function fetchAsrConsole(limit = 20) {
-  const safeLimit = Math.max(1, Math.min(200, Number(limit || 20)));
-  return requestJson<AsrConsoleResponse>(`/asr/console?limit=${safeLimit}`, { retry: 0 });
 }

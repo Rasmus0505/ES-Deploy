@@ -324,39 +324,6 @@ export interface WalletPacksResponse {
   cost_multiplier: number;
 }
 
-export type AsrRouteMode = 'dashscope_direct' | 'oneapi_fallback';
-
-export interface AsrWalletChargeItem {
-  job_id: string;
-  billed_seconds: number;
-  base_cost_cny: number;
-  multiplier: number;
-  billed_cost_cny: number;
-  billed_quota: number;
-  created_at: number;
-}
-
-export interface AsrConsoleResponse {
-  route_mode: AsrRouteMode;
-  route_base_url: string;
-  api_key_configured: boolean;
-  api_key_masked: string;
-  cost_multiplier: number;
-  quota_per_cny: number;
-  submit_min_remaining_quota: number;
-  user_id: string;
-  username: string;
-  quota: number;
-  used_quota: number;
-  remaining_quota: number;
-  request_count: number;
-  asr_used_quota: number;
-  asr_charge_count: number;
-  asr_base_cost_cny: number;
-  asr_billed_cost_cny: number;
-  charges: AsrWalletChargeItem[];
-}
-
 export interface ReadingChoiceQuestion {
   question_id: string;
   question: string;

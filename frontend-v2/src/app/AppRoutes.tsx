@@ -6,7 +6,6 @@ import { ListeningPracticeRuntimeBridge } from '../features/listening-practice/L
 import { ListeningUploadLayoutBridge } from '../features/listening-upload/ListeningUploadLayoutBridge';
 import { ProfilePage } from '../features/profile/ProfilePage';
 import { ReadingPage } from '../features/reading/ReadingPage';
-import { AsrConsolePage } from '../features/wallet/AsrConsolePage';
 import { WalletPage } from '../features/wallet/WalletPage';
 import { fetchAuthMe } from '../lib/api/auth';
 import { clearAuthToken, getAuthToken } from '../lib/api/auth-token';
@@ -61,7 +60,6 @@ export function AppRoutes() {
       <Route path="/listening/practice" element={<RequireAuth><ListeningPracticeRuntimeBridge /></RequireAuth>} />
       <Route path="/reading" element={<RequireAuth><ReadingPage /></RequireAuth>} />
       <Route path="/wallet" element={<RequireAuth><WalletPage /></RequireAuth>} />
-      <Route path="/asr-console" element={<RequireAuth><AsrConsolePage /></RequireAuth>} />
       <Route path="/profile" element={<RequireAuth><ProfilePage /></RequireAuth>} />
       <Route path="/vocab" element={<RequireAuth><Navigate to="/listening" replace /></RequireAuth>} />
       <Route path="*" element={<Navigate to="/listening" replace />} />
